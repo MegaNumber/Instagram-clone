@@ -14,6 +14,13 @@ const apiRouter = require('./routes');
 const app = express();
 const PORT = process.env.PORT || 9000;
 
+// ============================================================
+// تغییر جدید ۱: سرو فایل‌های استاتیک از پوشه 'public' در حالت توسعه
+// این خط تضمین می‌کند که عکس‌های آپلودشده در 'public/uploads'
+// همیشه از طریق مرورگر قابل دیدن باشند
+// ============================================================
+app.use(express.static(path.join(__dirname, 'public')));
+
 if (process.env.NODE_ENV !== 'production') {
   const morgan = require('morgan');
   app.use(morgan('dev'));
@@ -28,12 +35,25 @@ app.use('/api', apiRouter);
 
 if (process.env.NODE_ENV === 'production') {
   app.use(compression());
+  // ============================================================
+  // تغییر جدید ۲: در حالت تولید، سرو فایل‌های ساخته‌شده ری‌اکت
+  // این بخش قبلاً وجود داشت و فقط برای تأکید نگهش می‌داریم
+  // ============================================================
   app.use(express.static(path.join(__dirname, 'client/build')));
 
+  // توجه: این بخش برای سرو فایل‌های اصلی ری‌اکت است.
+  // فایل‌های پوشه 'public/uploads' همچنان از خط قبلی (بیرون از بلاک if) سرو می‌شوند.
   app.get('*', function (req, res) {
     res.sendFile(path.join(__dirname, 'client/build', 'index.html'));
   });
 }
+
+// ============================================================
+// تغییر جدید ۳: اضافه کردن مسیر مستقیم برای دسترسی به فایل‌های uploads
+// این یک لایه اطمینان اضافی است. اگر به هر دلیلی فایل‌ها از ریشه / پیدا نشدند،
+// این مسیر کمکی وارد عمل می‌شود
+// ============================================================
+app.use('/uploads', express.static(path.join(__dirname, 'public/uploads')));
 
 (async function () {
   try {
@@ -48,6 +68,7 @@ if (process.env.NODE_ENV === 'production') {
   }
 })();
 
+// مدیریت خطاها (بدون تغییر)
 app.use((err, req, res, next) => {
   console.log(err.message);
   if (!err.statusCode) {
@@ -76,7 +97,7 @@ const io = socketio(expressServer);
 app.set('socketio', io);
 console.log('Socket.io listening for connections');
 
-// Authenticate before establishing a socket connection
+// احراز هویت برای اتصال سوکت (بدون تغییر)
 io.use((socket, next) => {
   const token = socket.handshake.query.token;
   if (token) {
