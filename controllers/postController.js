@@ -15,7 +15,23 @@ const { retrieveComments, populatePostsPipeline } = require('../utils/controller
 const filters = require('../utils/filters');
 const storageService = require('../utils/storage');
 const { saveUploadedFile } = require('../utils/fileUpload');
+// مسیر فایل: /controllers/postController.js — بخش retrievePostFeed
+// (افزودن کش — فقط تکه کد مورد نیاز نمایش داده می‌شود)
 
+const redisCache = require('../services/redisCache');
+
+module.exports.retrievePostFeed = asyncHandler(async (req, res) => {
+    const user = res.locals.user;
+    const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+    const cacheKey = `feed:${user._id}:${offset}`;
+
+    const result = await redisCache.get(cacheKey, async () => {
+        // ... منطق اصلی دریافت پست‌ها (aggregation) ...
+        return posts;
+    }, 60); // TTL=۶۰ ثانیه
+
+    res.status(200).json({ success: true, data: result });
+});
 // ... (توابع کمکی extractHashtags، generateThumbnail و غیره بدون تغییر)
 
 module.exports.createPost = asyncHandler(async (req, res) => {
