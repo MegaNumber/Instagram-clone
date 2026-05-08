@@ -32,6 +32,9 @@ const jwt = require('jsonwebtoken');
 // بخش ۳: ایمپورت مسیرهای API
 // ============================================================
 const apiRouter = require('./routes');
+const storyRoutes = require('./routes/story');
+const messageRoutes = require('./routes/message');
+const reelRoutes = require('./routes/reel');
 
 // ============================================================
 // بخش ۴: تنظیمات اولیه برنامه
@@ -112,7 +115,9 @@ app.use('/uploads', express.static(path.join(__dirname, 'public/uploads')));
 // بخش ۱۰: مسیرهای API
 // ============================================================
 app.use('/api', apiRouter);
-
+app.use('/api/stories', storyRoutes);
+app.use('/api/messages', messageRoutes);
+app.use('/api/reels', reelRoutes);
 // ============================================================
 // بخش ۱۱: تنظیمات مخصوص محیط تولید
 // ============================================================
