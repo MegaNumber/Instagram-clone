@@ -11,5 +11,9 @@ apiRouter.use('/user', userRouter);
 apiRouter.use('/post', postRouter);
 apiRouter.use('/comment', commentRouter);
 apiRouter.use('/notification', notificationRouter);
+// ⬇️ سه خط جدید اضافه کنید
+router.use('/stories', require('./story'));
+router.use('/messages', require('./message'));
+router.use('/reels', require('./reel'));
 
 module.exports = apiRouter;
