@@ -1,19 +1,14 @@
-const express = require('express');
-const authRouter = require('./auth');
-const userRouter = require('./user');
-const postRouter = require('./post');
-const commentRouter = require('./comment');
-const notificationRouter = require('./notification');
-const apiRouter = express.Router();
+// مسیر فایل: /routes/index.js
+const router = require('express').Router();
 
-apiRouter.use('/auth', authRouter);
-apiRouter.use('/user', userRouter);
-apiRouter.use('/post', postRouter);
-apiRouter.use('/comment', commentRouter);
-apiRouter.use('/notification', notificationRouter);
-// ⬇️ سه خط جدید اضافه کنید
+router.use('/auth', require('./auth'));
+router.use('/users', require('./user'));
+router.use('/posts', require('./post'));
+router.use('/comments', require('./comment'));
+router.use('/notifications', require('./notification'));
+// مسیرهای جدید (از طریق index.js اصلی اضافه شده‌اند، اینجا نیاز نیست ولی برای سازگاری می‌آوریم)
 router.use('/stories', require('./story'));
 router.use('/messages', require('./message'));
 router.use('/reels', require('./reel'));
 
-module.exports = apiRouter;
+module.exports = router;
