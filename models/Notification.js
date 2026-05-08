@@ -1,7 +1,12 @@
 // مسیر فایل: /models/Notification.js
 // توضیح: مدل Mongoose برای نوتیفیکیشن‌ها. این فایل ساختار انواع اطلاعیه‌های
-// ارسالی به کاربران را تعریف می‌کند و شامل اعتبارسنجی، ایندکس‌های عملکردی
-// و مکانیزم‌های پاک‌سازی خودکار است.
+// ارسالی به کاربران (follow, like, comment, mention) را تعریف می‌کند.
+// دارای ایندکس‌های ترکیبی برای عملکرد سریع، ایندکس TTL برای حذف خودکار
+// نوتیفیکیشن‌های قدیمی، فیلد مجازی timeAgo برای نمایش زمان نسبی،
+// و متدهای استاتیک کمکی برای علامت‌گذاری خوانده‌شده است.
+//
+// @version 2.3.9
+// @since 2026
 
 // ============================================================
 // بخش ۱: ایمپورت ماژول‌های مورد نیاز
@@ -12,33 +17,26 @@ const Schema = mongoose.Schema;
 // ============================================================
 // بخش ۲: ثابت‌های پیکربندی
 // ============================================================
-// انواع معتبر نوتیفیکیشن (مطابق با منطق برنامه)
 const NOTIFICATION_TYPES = ['follow', 'like', 'comment', 'mention'];
-
-// مدت زمان حفظ نوتیفیکیشن (به صورت اختیاری - اگر بخواهیم به‌طور خودکار حذف شوند)
-// 90 روز = 90 * 24 * 60 * 60 ثانیه
 const NOTIFICATION_RETENTION_SECONDS = 90 * 24 * 60 * 60; // 90 روز
 
 // ============================================================
-// بخش ۳: تعریف طرحواره نوتیفیکیشن (Notification Schema)
+// بخش ۳: تعریف طرحواره نوتیفیکیشن
 // ============================================================
 const NotificationSchema = new Schema(
     {
-        // ---------- فرستنده نوتیفیکیشن ----------
         sender: {
             type: Schema.Types.ObjectId,
             ref: 'User',
             required: [true, 'فرستنده نوتیفیکیشن الزامی است.'],
-            index: true, // ایندکس برای یافتن نوتیفیکیشن‌های ارسالی یک کاربر
+            index: true,
         },
-        // ---------- گیرنده نوتیفیکیشن ----------
         receiver: {
             type: Schema.Types.ObjectId,
             ref: 'User',
             required: [true, 'گیرنده نوتیفیکیشن الزامی است.'],
-            index: true, // ایندکس اصلی برای نمایش نوتیفیکیشن‌های یک کاربر
+            index: true,
         },
-        // ---------- نوع نوتیفیکیشن ----------
         notificationType: {
             type: String,
             required: [true, 'نوع نوتیفیکیشن الزامی است.'],
@@ -47,53 +45,35 @@ const NotificationSchema = new Schema(
                 message: `نوع نوتیفیکیشن باید یکی از موارد ${NOTIFICATION_TYPES.join(', ')} باشد.`,
             },
         },
-        // ---------- داده‌های اضافی وابسته به نوع نوتیفیکیشن ----------
-        // این فیلد به صورت یک شیء آزاد (Object) ذخیره می‌شود و می‌تواند
-        // شامل شناسه پست، تصویر، پیام و … باشد.
         notificationData: {
-            type: Schema.Types.Mixed, // استفاده از Mixed به جای Object برای انعطاف‌پذیری
+            type: Schema.Types.Mixed,
             default: {},
         },
-        // ---------- وضعیت خوانده شدن ----------
         read: {
             type: Boolean,
             default: false,
-            index: true, // برای فیلتر کردن نوتیفیکیشن‌های خوانده‌نشده
+            index: true,
         },
-        // حذف فیلد 'date' به دلیل استفاده از timestamps خودکار
     },
-    // گزینه‌های طرحواره
     {
-        // افزودن خودکار createdAt و updatedAt
         timestamps: {
-            createdAt: 'createdAt', // تاریخ ایجاد (جایگزین فیلد date)
-            updatedAt: 'updatedAt', // تاریخ آخرین تغییر (مثلاً تغییر read)
+            createdAt: 'createdAt',
+            updatedAt: 'updatedAt',
         },
-        versionKey: false, // حذف فیلد __v
+        versionKey: false,
         toJSON: { virtuals: true },
         toObject: { virtuals: true },
     }
 );
 
 // ============================================================
-// بخش ۴: ایندکس‌های ترکیبی برای عملکرد بهینه
+// بخش ۴: ایندکس‌های ترکیبی
 // ============================================================
-
-// ایندکس اصلی: دریافت نوتیفیکیشن‌های یک کاربر به ترتیب جدیدترین
-// طبق قانون ESR: Equality (receiver) سپس Sort (createdAt)
 NotificationSchema.index({ receiver: 1, createdAt: -1 });
-
-// ایندکس برای نمایش نوتیفیکیشن‌های خوانده‌نشده یک کاربر
 NotificationSchema.index({ receiver: 1, read: 1, createdAt: -1 });
-
-// ایندکس برای جستجوی نوتیفیکیشن بر اساس فرستنده و نوع
 NotificationSchema.index({ sender: 1, notificationType: 1 });
 
-// ایندکس TTL (Time-To-Live) برای حذف خودکار نوتیفیکیشن‌های قدیمی
-// این ایندکس پس از 90 روز سند را به طور خودکار از دیتابیس پاک می‌کند.
-// برای فعال‌سازی، نیاز به اجرای mongoose.connection.createCollection نیست
-// و Mongoose به طور خودکار در پس‌زمینه آن را مدیریت می‌کند.
-// اگر نمی‌خواهید نوتیفیکیشن‌ها حذف شوند، این ایندکس را کامنت کنید.
+// ایندکس TTL برای حذف خودکار پس از ۹۰ روز
 NotificationSchema.index(
     { createdAt: 1 },
     { expireAfterSeconds: NOTIFICATION_RETENTION_SECONDS }
@@ -106,7 +86,7 @@ NotificationSchema.index(
 /**
  * @virtual
  * @description محاسبه زمان سپری‌شده از ایجاد نوتیفیکیشن (برای نمایش نسبی)
- * @returns {string} - متن زمان نسبی مانند "۵ دقیقه پیش"
+ * @returns {string} - متن زمان نسبی
  */
 NotificationSchema.virtual('timeAgo').get(function () {
     if (!this.createdAt) return '';
@@ -123,20 +103,29 @@ NotificationSchema.virtual('timeAgo').get(function () {
 });
 
 // ============================================================
-// بخش ۶: هوک‌های Mongoose
+// بخش ۶: متدهای استاتیک (کمکی)
 // ============================================================
-// (در صورت نیاز می‌توان پیش‌بینی‌های لازم را اضافه کرد)
+
+/**
+ * علامت‌گذاری تمام نوتیفیکیشن‌های خوانده‌نشدهٔ یک کاربر به عنوان خوانده‌شده
+ * @param {string} userId - شناسه کاربر
+ * @returns {Promise<number>} - تعداد اسناد به‌روزرسانی‌شده
+ */
+NotificationSchema.statics.markAllAsRead = async function (userId) {
+    const result = await this.updateMany(
+        { receiver: userId, read: false },
+        { $set: { read: true } }
+    );
+    return result.modifiedCount;
+};
 
 // ============================================================
 // بخش ۷: تبدیل خروجی JSON
 // ============================================================
 NotificationSchema.set('toJSON', {
     transform: function (doc, ret) {
-        // افزودن فیلد id به عنوان یک کپی از _id
         ret.id = ret._id;
         delete ret.__v;
-        // بازگرداندن createdAt به عنوان date برای سازگاری با کدهای قدیمی (اختیاری)
-        // ret.date = ret.createdAt;
         return ret;
     },
 });
@@ -145,5 +134,4 @@ NotificationSchema.set('toJSON', {
 // بخش ۸: ایجاد و صادرات مدل
 // ============================================================
 const Notification = mongoose.model('Notification', NotificationSchema);
-
 module.exports = Notification;
