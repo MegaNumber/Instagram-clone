@@ -1,3 +1,10 @@
+// مسیر فایل: /controllers/userController.js
+// توضیح: کنترلر مدیریت کاربران. این فایل منطق اصلی مربوط به پروفایل کاربر،
+// دنبال کردن، بوکمارک کردن، جستجو و سایر عملیات مرتبط با کاربر را مدیریت می‌کند.
+
+// ============================================================
+// بخش ۱: ایمپورت ماژول‌های مورد نیاز
+// ============================================================
 const User = require('../models/User');
 const Post = require('../models/Post');
 const Followers = require('../models/Followers');
@@ -10,6 +17,12 @@ const cloudinary = require('cloudinary').v2;
 const fs = require('fs');
 const crypto = require('crypto');
 
+// کتابخانه‌های کمکی جدید
+const retry = require('async-retry'); // برای تلاش مجدد عملیات‌های حساس
+const asyncHandler = require('../utils/asyncHandler'); // حذف try-catch تکراری
+const userService = require('../services/userService'); // انتقال منطق پیچیده به سرویس
+
+// ابزارهای اعتبارسنجی
 const {
   validateEmail,
   validateFullName,
@@ -19,272 +32,351 @@ const {
 } = require('../utils/validation');
 const { sendConfirmationEmail } = require('../utils/controllerUtils');
 
-module.exports.retrieveUser = async (req, res, next) => {
-  const { username } = req.params;
-  const requestingUser = res.locals.user;
-  try {
-    const user = await User.findOne(
-      { username },
-      'username fullName avatar bio bookmarks fullName _id website'
-    );
-    if (!user) {
-      return res
-        .status(404)
-        .send({ error: 'Could not find a user with that username.' });
-    }
+// ============================================================
+// بخش ۲: ثابت‌های پیکربندی
+// ============================================================
+const PAGINATION_LIMIT = 12; // تعداد آیتم در هر صفحه
+const MAX_PAGINATION_LIMIT = 50; // حداکثر آیتم مجاز در هر صفحه
 
-    const posts = await Post.aggregate([
-      {
-        $facet: {
-          data: [
-            { $match: { author: ObjectId(user._id) } },
-            { $sort: { date: -1 } },
-            { $limit: 12 },
-            {
-              $lookup: {
-                from: 'postvotes',
-                localField: '_id',
-                foreignField: 'post',
-                as: 'postvotes',
-              },
-            },
-            {
-              $lookup: {
-                from: 'comments',
-                localField: '_id',
-                foreignField: 'post',
-                as: 'comments',
-              },
-            },
-            {
-              $lookup: {
-                from: 'commentreplies',
-                localField: 'comments._id',
-                foreignField: 'parentComment',
-                as: 'commentReplies',
-              },
-            },
-            {
-              $unwind: '$postvotes',
-            },
-            {
-              $addFields: { image: '$thumbnail' },
-            },
-            {
-              $project: {
-                user: true,
-                followers: true,
-                following: true,
-                comments: {
-                  $sum: [{ $size: '$comments' }, { $size: '$commentReplies' }],
-                },
-                image: true,
-                thumbnail: true,
-                filter: true,
-                caption: true,
-                author: true,
-                postVotes: { $size: '$postvotes.votes' },
-              },
-            },
-          ],
-          postCount: [
-            { $match: { author: ObjectId(user._id) } },
-            { $count: 'postCount' },
-          ],
-        },
-      },
-      { $unwind: '$postCount' },
-      {
-        $project: {
-          data: true,
-          postCount: '$postCount.postCount',
-        },
-      },
-    ]);
+// تنظیمات Cloudinary (بهتر است در فایل کانفیگ جداگانه باشد)
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
-    const followersDocument = await Followers.findOne({
-      user: ObjectId(user._id),
-    });
+// ============================================================
+// بخش ۳: توابع کمکی (Utility Functions)
+// ============================================================
 
-    const followingDocument = await Following.findOne({
-      user: ObjectId(user._id),
-    });
-
-    return res.send({
-      user,
-      followers: followersDocument.followers.length,
-      following: followingDocument.following.length,
-      // Check if the requesting user follows the retrieved user
-      isFollowing: requestingUser
-        ? !!followersDocument.followers.find(
-            (follower) => String(follower.user) === String(requestingUser._id)
-          )
-        : false,
-      posts: posts[0],
-    });
-  } catch (err) {
-    next(err);
-  }
+/**
+ * @function parsePagination
+ * @description تجزیه و اعتبارسنجی پارامترهای صفحه‌بندی از درخواست
+ * @param {object} query - شیء query درخواست
+ * @returns {object} - شامل offset و limit معتبر
+ */
+const parsePagination = (query) => {
+  const offset = Math.max(0, parseInt(query.offset, 10) || 0);
+  const limit = Math.min(
+    MAX_PAGINATION_LIMIT,
+    Math.max(1, parseInt(query.limit, 10) || PAGINATION_LIMIT)
+  );
+  return { offset, limit };
 };
 
-module.exports.retrievePosts = async (req, res, next) => {
-  // Retrieve a user's posts with the post's comments & likes
-  const { username, offset = 0 } = req.params;
-  try {
-    const posts = await Post.aggregate([
-      { $sort: { date: -1 } },
-      { $skip: Number(offset) },
+// ============================================================
+// بخش ۴: کنترلرهای اصلی
+// ============================================================
+
+/**
+ * @function retrieveUser
+ * @description دریافت اطلاعات کامل پروفایل یک کاربر به همراه پست‌ها
+ * @route GET /api/users/:username
+ */
+module.exports.retrieveUser = asyncHandler(async (req, res) => {
+  const { username } = req.params;
+  const requestingUser = res.locals.user;
+
+  // ۱. یافتن کاربر با اسم کاربری
+  const user = await User.findOne({ username })
+    .select('username fullName avatar bio bookmarks website _id')
+    .lean(); // .lean() برای بازگرداندن آبجکت ساده JS (عملکرد بهتر)
+
+  if (!user) {
+    return res.status(404).json({
+      success: false,
+      error: 'کاربری با این نام کاربری یافت نشد.',
+    });
+  }
+
+  // ۲. دریافت اطلاعات پست‌ها، دنبال‌کننده‌ها و دنبال‌شونده‌ها به صورت همزمان
+  const [postsResult, followersDocument, followingDocument] = await Promise.all([
+    Post.aggregate([
+      { $match: { author: ObjectId(user._id) } },
+      { $sort: { createdAt: -1 } },
       { $limit: 12 },
-      {
-        $lookup: {
-          from: 'users',
-          localField: 'author',
-          foreignField: '_id',
-          as: 'user',
-        },
-      },
-      { $match: { 'user.username': username } },
-      {
-        $lookup: {
-          from: 'comments',
-          localField: '_id',
-          foreignField: 'post',
-          as: 'comments',
-        },
-      },
+      // استفاده از lookup بهینه‌شده
       {
         $lookup: {
           from: 'postvotes',
           localField: '_id',
           foreignField: 'post',
+          pipeline: [{ $project: { _id: 1, votes: 1 } }],
           as: 'postVotes',
         },
       },
-      { $unwind: '$postVotes' },
       {
-        $project: {
-          image: true,
-          caption: true,
-          date: true,
-          'user.username': true,
-          'user.avatar': true,
-          comments: { $size: '$comments' },
-          postVotes: { $size: '$postVotes.votes' },
+        $lookup: {
+          from: 'comments',
+          localField: '_id',
+          foreignField: 'post',
+          pipeline: [{ $project: { _id: 1 } }],
+          as: 'comments',
         },
       },
-    ]);
-    if (posts.length === 0) {
-      return res.status(404).send({ error: 'Could not find any posts.' });
-    }
-    return res.send(posts);
-  } catch (err) {
-    next(err);
-  }
-};
+      // افزودن تعداد لایک‌ها و کامنت‌ها با استفاده از $addFields
+      {
+        $addFields: {
+          likeCount: { $size: '$postVotes.votes' },
+          commentCount: { $size: '$comments' },
+          image: '$thumbnail',
+        },
+      },
+      // انتخاب فیلدهای نهایی
+      {
+        $project: {
+          image: 1,
+          thumbnail: 1,
+          filter: 1,
+          caption: 1,
+          author: 1,
+          likeCount: 1,
+          commentCount: 1,
+          createdAt: 1,
+        },
+      },
+    ]),
+    Followers.findOne({ user: ObjectId(user._id) }).lean(),
+    Following.findOne({ user: ObjectId(user._id) }).lean(),
+  ]);
 
-module.exports.bookmarkPost = async (req, res, next) => {
+  // ۳. محاسبه وضعیت دنبال‌کردن
+  const isFollowing = requestingUser
+    ? followersDocument?.followers?.some(
+        (follower) => String(follower.user) === String(requestingUser._id)
+      ) ?? false
+    : false;
+
+  // ۴. ارسال پاسخ نهایی
+  return res.status(200).json({
+    success: true,
+    data: {
+      user,
+      posts: postsResult,
+      followersCount: followersDocument?.followers?.length || 0,
+      followingCount: followingDocument?.following?.length || 0,
+      postCount: postsResult.length, // تعداد تقریبی
+      isFollowing,
+    },
+  });
+});
+
+/**
+ * @function retrievePosts
+ * @description دریافت پست‌های یک کاربر با صفحه‌بندی
+ * @route GET /api/users/:username/posts?offset=0&limit=12
+ */
+module.exports.retrievePosts = asyncHandler(async (req, res) => {
+  const { username } = req.params;
+  const { offset, limit } = parsePagination(req.query);
+
+  const posts = await Post.aggregate([
+    { $sort: { createdAt: -1 } },
+    { $skip: offset },
+    { $limit: limit },
+    {
+      $lookup: {
+        from: 'users',
+        localField: 'author',
+        foreignField: '_id',
+        pipeline: [{ $project: { username: 1, avatar: 1 } }],
+        as: 'user',
+      },
+    },
+    { $unwind: '$user' },
+    { $match: { 'user.username': username } },
+    {
+      $lookup: {
+        from: 'comments',
+        localField: '_id',
+        foreignField: 'post',
+        pipeline: [{ $project: { _id: 1 } }],
+        as: 'comments',
+      },
+    },
+    {
+      $lookup: {
+        from: 'postvotes',
+        localField: '_id',
+        foreignField: 'post',
+        pipeline: [{ $project: { _id: 1, votes: 1 } }],
+        as: 'postVotes',
+      },
+    },
+    {
+      $addFields: {
+        likeCount: { $size: '$postVotes.votes' },
+        commentCount: { $size: '$comments' },
+      },
+    },
+    {
+      $project: {
+        image: 1,
+        caption: 1,
+        createdAt: 1,
+        'user.username': 1,
+        'user.avatar': 1,
+        likeCount: 1,
+        commentCount: 1,
+      },
+    },
+  ]);
+
+  if (posts.length === 0) {
+    return res.status(404).json({
+      success: false,
+      error: 'هیچ پستی برای این کاربر یافت نشد.',
+    });
+  }
+
+  return res.status(200).json({
+    success: true,
+    data: posts,
+    pagination: {
+      offset,
+      limit,
+      hasMore: posts.length === limit, // اگر تعداد برابر limit باشد، احتمالاً صفحه بعدی وجود دارد
+    },
+  });
+});
+
+/**
+ * @function bookmarkPost
+ * @description اضافه یا حذف یک پست از بوکمارک‌های کاربر
+ * @route POST /api/users/bookmark/:postId
+ */
+module.exports.bookmarkPost = asyncHandler(async (req, res) => {
   const { postId } = req.params;
   const user = res.locals.user;
 
-  try {
-    const post = await Post.findById(postId);
-    if (!post) {
-      return res
-        .status(404)
-        .send({ error: 'Could not find a post with that id.' });
-    }
-
-    const userBookmarkUpdate = await User.updateOne(
-      {
-        _id: user._id,
-        'bookmarks.post': { $ne: postId },
-      },
-      { $push: { bookmarks: { post: postId } } }
-    );
-    if (!userBookmarkUpdate.nModified) {
-      if (!userBookmarkUpdate.ok) {
-        return res.status(500).send({ error: 'Could not bookmark the post.' });
-      }
-      // The above query did not modify anything meaning that the user has already bookmarked the post
-      // Remove the bookmark instead
-      const userRemoveBookmarkUpdate = await User.updateOne(
-        { _id: user._id },
-        { $pull: { bookmarks: { post: postId } } }
-      );
-      if (!userRemoveBookmarkUpdate.nModified) {
-        return res.status(500).send({ error: 'Could not bookmark the post.' });
-      }
-      return res.send({ success: true, operation: 'remove' });
-    }
-    return res.send({ success: true, operation: 'add' });
-  } catch (err) {
-    next(err);
+  // ۱. بررسی وجود پست
+  const post = await Post.findById(postId).select('_id');
+  if (!post) {
+    return res.status(404).json({
+      success: false,
+      error: 'پستی با این شناسه یافت نشد.',
+    });
   }
-};
 
-module.exports.followUser = async (req, res, next) => {
+  // ۲. تلاش برای افزودن بوکمارک (با اصلاح نام فیلد)
+  const userBookmarkUpdate = await User.updateOne(
+    {
+      _id: user._id,
+      'bookmarks.post': { $ne: postId },
+    },
+    { $push: { bookmarks: { post: postId } } }
+  );
+
+  // ۳. اگر تغییری ایجاد نشد، یعنی قبلاً بوکمارک شده بود، پس حذفش می‌کنیم
+  if (userBookmarkUpdate.matchedCount > 0 && userBookmarkUpdate.modifiedCount === 0) {
+    const userRemoveBookmarkUpdate = await User.updateOne(
+      { _id: user._id },
+      { $pull: { bookmarks: { post: postId } } }
+    );
+
+    if (userRemoveBookmarkUpdate.modifiedCount === 0) {
+      return res.status(500).json({
+        success: false,
+        error: 'عملیات حذف بوکمارک با مشکل مواجه شد.',
+      });
+    }
+    return res.status(200).json({
+      success: true,
+      operation: 'remove',
+      message: 'پست از بوکمارک‌ها حذف شد.',
+    });
+  }
+
+  // ۴. در غیر این صورت، بوکمارک اضافه شده است
+  return res.status(200).json({
+    success: true,
+    operation: 'add',
+    message: 'پست به بوکمارک‌ها اضافه شد.',
+  });
+});
+
+/**
+ * @function followUser
+ * @description دنبال کردن یا لغو دنبال کردن یک کاربر با منطق Retry
+ * @route POST /api/users/:userId/follow
+ */
+module.exports.followUser = asyncHandler(async (req, res) => {
   const { userId } = req.params;
   const user = res.locals.user;
 
-  try {
-    const userToFollow = await User.findById(userId);
-    if (!userToFollow) {
-      return res
-        .status(400)
-        .send({ error: 'Could not find a user with that id.' });
-    }
+  // ۱. بررسی وجود کاربر هدف
+  const userToFollow = await User.findById(userId).select('_id');
+  if (!userToFollow) {
+    return res.status(404).json({
+      success: false,
+      error: 'کاربر مورد نظر برای دنبال کردن یافت نشد.',
+    });
+  }
 
-    const followerUpdate = await Followers.updateOne(
-      { user: userId, 'followers.user': { $ne: user._id } },
-      { $push: { followers: { user: user._id } } }
-    );
-
-    const followingUpdate = await Following.updateOne(
-      { user: user._id, 'following.user': { $ne: userId } },
-      { $push: { following: { user: userId } } }
-    );
-
-    if (!followerUpdate.nModified || !followingUpdate.nModified) {
-      if (!followerUpdate.ok || !followingUpdate.ok) {
-        return res
-          .status(500)
-          .send({ error: 'Could not follow user please try again later.' });
-      }
-      // Nothing was modified in the above query meaning that the user is already following
-      // Unfollow instead
-      const followerUnfollowUpdate = await Followers.updateOne(
-        {
-          user: userId,
-        },
-        { $pull: { followers: { user: user._id } } }
+  // ۲. اجرای عملیات دنبال کردن با تلاش مجدد (Retry Logic)
+  const result = await retry(
+    async (bail) => {
+      // تلاش برای افزودن به لیست دنبال‌کننده‌ها و دنبال‌شونده‌ها
+      const followerUpdate = await Followers.updateOne(
+        { user: userId, 'followers.user': { $ne: user._id } },
+        { $push: { followers: { user: user._id } } }
       );
 
-      const followingUnfollowUpdate = await Following.updateOne(
-        { user: user._id },
-        { $pull: { following: { user: userId } } }
+      const followingUpdate = await Following.updateOne(
+        { user: user._id, 'following.user': { $ne: userId } },
+        { $push: { following: { user: userId } } }
       );
-      if (!followerUnfollowUpdate.ok || !followingUnfollowUpdate.ok) {
-        return res
-          .status(500)
-          .send({ error: 'Could not follow user please try again later.' });
-      }
-      return res.send({ success: true, operation: 'unfollow' });
-    }
 
-    const notification = new Notification({
+      // اگر خطایی در به‌روزرسانی رخ داد، خطا را پرتاب کن
+      if (!followerUpdate.acknowledged || !followingUpdate.acknowledged) {
+        throw new Error('به‌روزرسانی دنبال‌کننده‌ها با خطا مواجه شد.');
+      }
+
+      // اگر تغییری ایجاد نشد، یعنی کاربر قبلاً دنبال شده بود، پس آنفالو می‌کنیم
+      if (followerUpdate.modifiedCount === 0 && followingUpdate.modifiedCount === 0) {
+        const followerUnfollowUpdate = await Followers.updateOne(
+          { user: userId },
+          { $pull: { followers: { user: user._id } } }
+        );
+
+        const followingUnfollowUpdate = await Following.updateOne(
+          { user: user._id },
+          { $pull: { following: { user: userId } } }
+        );
+
+        if (!followerUnfollowUpdate.acknowledged || !followingUnfollowUpdate.acknowledged) {
+          throw new Error('عملیات آنفالو با خطا مواجه شد.');
+        }
+
+        return { operation: 'unfollow' };
+      }
+
+      return { operation: 'follow' };
+    },
+    {
+      retries: 2, // تعداد تلاش‌های مجدد
+      minTimeout: 100, // حداقل زمان انتظار بین تلاش‌ها
+    }
+  );
+
+  // ۳. اگر عملیات "follow" بوده، نوتیفیکیشن ارسال کن
+  if (result.operation === 'follow') {
+    const [sender, isFollowing] = await Promise.all([
+      User.findById(user._id).select('username avatar').lean(),
+      Following.findOne({
+        user: userId,
+        'following.user': user._id,
+      }).lean(),
+    ]);
+
+    const notification = await Notification.create({
       notificationType: 'follow',
       sender: user._id,
       receiver: userId,
       date: Date.now(),
     });
 
-    const sender = await User.findById(user._id, 'username avatar');
-    const isFollowing = await Following.findOne({
-      user: userId,
-      'following.user': user._id,
-    });
-
-    await notification.save();
+    // ارسال نوتیفیکیشن از طریق سوکت
     socketHandler.sendNotification(req, {
       notificationType: 'follow',
       sender: {
@@ -296,24 +388,35 @@ module.exports.followUser = async (req, res, next) => {
       date: notification.date,
       isFollowing: !!isFollowing,
     });
-
-    res.send({ success: true, operation: 'follow' });
-  } catch (err) {
-    next(err);
   }
-};
+
+  // ۴. ارسال پاسخ نهایی
+  return res.status(200).json({
+    success: true,
+    operation: result.operation,
+    message:
+      result.operation === 'follow'
+        ? 'کاربر با موفقیت دنبال شد.'
+        : 'دنبال کردن کاربر لغو شد.',
+  });
+});
+
+// ============================================================
+// بخش ۵: بازیابی کاربران مرتبط (Followers/Following)
+// ============================================================
 
 /**
- * Retrieves either who a specific user follows or who is following the user.
- * Also retrieves whether the requesting user is following the returned users
  * @function retrieveRelatedUsers
- * @param {object} user The user object passed on from other middlewares
- * @param {string} userId Id of the user to be used in the query
- * @param {number} offset The offset for how many documents to skip
- * @param {boolean} followers Whether to query who is following the user or who the user follows default is the latter
- * @returns {array} Array of users
+ * @description دریافت لیست دنبال‌کننده‌ها یا دنبال‌شونده‌های یک کاربر
+ * @param {object} user - کاربر درخواست‌دهنده
+ * @param {string} userId - شناسه کاربر هدف
+ * @param {number} offset - تعداد آیتم‌های رد شده
+ * @param {boolean} followers - true برای دنبال‌کننده‌ها، false برای دنبال‌شونده‌ها
+ * @returns {array} - لیست کاربران
  */
 const retrieveRelatedUsers = async (user, userId, offset, followers) => {
+  const { limit } = parsePagination({ limit: 10 }); // استفاده از limit پیش‌فرض ۱۰
+
   const pipeline = [
     {
       $match: { user: ObjectId(userId) },
@@ -321,23 +424,17 @@ const retrieveRelatedUsers = async (user, userId, offset, followers) => {
     {
       $lookup: {
         from: 'users',
-        let: followers
-          ? { userId: '$followers.user' }
-          : { userId: '$following.user' },
+        let: {
+          userIds: followers ? '$followers.user' : '$following.user',
+        },
         pipeline: [
           {
             $match: {
-              // Using the $in operator instead of the $eq
-              // operator because we can't coerce the types
-              $expr: { $in: ['$_id', '$$userId'] },
+              $expr: { $in: ['$_id', '$$userIds'] },
             },
           },
-          {
-            $skip: Number(offset),
-          },
-          {
-            $limit: 10,
-          },
+          { $skip: Number(offset) },
+          { $limit: limit },
         ],
         as: 'users',
       },
@@ -347,16 +444,20 @@ const retrieveRelatedUsers = async (user, userId, offset, followers) => {
         from: 'followers',
         localField: 'users._id',
         foreignField: 'user',
+        pipeline: [{ $project: { _id: 1, followers: 1 } }],
         as: 'userFollowers',
       },
     },
     {
       $project: {
-        'users._id': true,
-        'users.username': true,
-        'users.avatar': true,
-        'users.fullName': true,
-        userFollowers: true,
+        'users._id': 1,
+        'users.username': 1,
+        'users.avatar': 1,
+        'users.fullName': 1,
+        userFollowers: 1,
+        totalCount: followers
+          ? { $size: '$followers' }
+          : { $size: '$following' },
       },
     },
   ];
@@ -365,337 +466,398 @@ const retrieveRelatedUsers = async (user, userId, offset, followers) => {
     ? await Followers.aggregate(pipeline)
     : await Following.aggregate(pipeline);
 
-  // Make a set to store the IDs of the followed users
+  if (!aggregation || aggregation.length === 0) {
+    return { users: [], totalCount: 0 };
+  }
+
+  const result = aggregation[0];
+
+  // محاسبه وضعیت دنبال‌کردن برای هر کاربر
   const followedUsers = new Set();
-  // Loop through every follower and add the id to the set if the user's id is in the array
-  aggregation[0].userFollowers.forEach((followingUser) => {
+  result.userFollowers?.forEach((followingUser) => {
     if (
-      !!followingUser.followers.find(
+      followingUser.followers?.some(
         (follower) => String(follower.user) === String(user._id)
       )
     ) {
       followedUsers.add(String(followingUser.user));
     }
   });
-  // Add the isFollowing key to the following object with a value
-  // depending on the outcome of the loop above
-  aggregation[0].users.forEach((followingUser) => {
+
+  result.users?.forEach((followingUser) => {
     followingUser.isFollowing = followedUsers.has(String(followingUser._id));
   });
 
-  return aggregation[0].users;
+  return { users: result.users || [], totalCount: result.totalCount || 0 };
 };
 
-module.exports.retrieveFollowing = async (req, res, next) => {
-  const { userId, offset = 0 } = req.params;
-  const user = res.locals.user;
-  try {
-    const users = await retrieveRelatedUsers(user, userId, offset);
-    return res.send(users);
-  } catch (err) {
-    next(err);
-  }
-};
-
-module.exports.retrieveFollowers = async (req, res, next) => {
+/**
+ * @function retrieveFollowing
+ * @description دریافت لیست دنبال‌شونده‌های یک کاربر
+ * @route GET /api/users/:userId/following?offset=0
+ */
+module.exports.retrieveFollowing = asyncHandler(async (req, res) => {
   const { userId, offset = 0 } = req.params;
   const user = res.locals.user;
 
-  try {
-    const users = await retrieveRelatedUsers(user, userId, offset, true);
-    return res.send(users);
-  } catch (err) {
-    next(err);
-  }
-};
+  const result = await retrieveRelatedUsers(user, userId, offset, false);
 
-module.exports.searchUsers = async (req, res, next) => {
-  const { username, offset = 0 } = req.params;
-  if (!username) {
-    return res
-      .status(400)
-      .send({ error: 'Please provide a user to search for.' });
+  return res.status(200).json({
+    success: true,
+    data: result.users,
+    totalCount: result.totalCount,
+  });
+});
+
+/**
+ * @function retrieveFollowers
+ * @description دریافت لیست دنبال‌کننده‌های یک کاربر
+ * @route GET /api/users/:userId/followers?offset=0
+ */
+module.exports.retrieveFollowers = asyncHandler(async (req, res) => {
+  const { userId, offset = 0 } = req.params;
+  const user = res.locals.user;
+
+  const result = await retrieveRelatedUsers(user, userId, offset, true);
+
+  return res.status(200).json({
+    success: true,
+    data: result.users,
+    totalCount: result.totalCount,
+  });
+});
+
+// ============================================================
+// بخش ۶: جستجوی کاربران
+// ============================================================
+
+/**
+ * @function searchUsers
+ * @description جستجوی کاربران بر اساس نام کاربری
+ * @route GET /api/users/search?username=something&offset=0
+ */
+module.exports.searchUsers = asyncHandler(async (req, res) => {
+  const { username, offset = 0 } = req.query;
+
+  if (!username || username.trim().length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: 'لطفاً یک نام کاربری برای جستجو وارد کنید.',
+    });
   }
 
-  try {
-    const users = await User.aggregate([
-      {
-        $match: {
-          username: { $regex: new RegExp(username), $options: 'i' },
-        },
+  const users = await User.aggregate([
+    {
+      $match: {
+        username: { $regex: username, $options: 'i' },
       },
-      {
-        $lookup: {
-          from: 'followers',
-          localField: '_id',
-          foreignField: 'user',
-          as: 'followers',
-        },
+    },
+    {
+      $lookup: {
+        from: 'followers',
+        localField: '_id',
+        foreignField: 'user',
+        pipeline: [{ $project: { _id: 1, followers: 1 } }],
+        as: 'followers',
       },
-      {
-        $unwind: '$followers',
+    },
+    {
+      $addFields: {
+        followersCount: { $size: { $ifNull: ['$followers.followers', []] } },
       },
-      {
-        $addFields: {
-          followersCount: { $size: '$followers.followers' },
-        },
+    },
+    { $sort: { followersCount: -1 } },
+    { $skip: Number(offset) },
+    { $limit: 10 },
+    {
+      $project: {
+        _id: 1,
+        username: 1,
+        avatar: 1,
+        fullName: 1,
       },
-      {
-        $sort: { followersCount: -1 },
-      },
-      {
-        $skip: Number(offset),
-      },
-      {
-        $limit: 10,
-      },
-      {
-        $project: {
-          _id: true,
-          username: true,
-          avatar: true,
-          fullName: true,
-        },
-      },
-    ]);
-    if (users.length === 0) {
-      return res
-        .status(404)
-        .send({ error: 'Could not find any users matching the criteria.' });
-    }
-    return res.send(users);
-  } catch (err) {
-    next(err);
-  }
-};
+    },
+  ]);
 
-module.exports.confirmUser = async (req, res, next) => {
+  if (users.length === 0) {
+    return res.status(404).json({
+      success: false,
+      error: 'هیچ کاربری با این مشخصات یافت نشد.',
+    });
+  }
+
+  return res.status(200).json({
+    success: true,
+    data: users,
+  });
+});
+
+// ============================================================
+// بخش ۷: تأیید ایمیل کاربر
+// ============================================================
+
+/**
+ * @function confirmUser
+ * @description تأیید ایمیل کاربر با استفاده از توکن ارسالی
+ * @route POST /api/users/confirm
+ */
+module.exports.confirmUser = asyncHandler(async (req, res) => {
   const { token } = req.body;
   const user = res.locals.user;
 
-  try {
-    const confirmationToken = await ConfirmationToken.findOne({
-      token,
-      user: user._id,
+  if (!token) {
+    return res.status(400).json({
+      success: false,
+      error: 'توکن تأیید الزامی است.',
     });
-    if (!confirmationToken) {
-      return res
-        .status(404)
-        .send({ error: 'Invalid or expired confirmation link.' });
-    }
-    await ConfirmationToken.deleteOne({ token, user: user._id });
-    await User.updateOne({ _id: user._id }, { confirmed: true });
-    return res.send();
-  } catch (err) {
-    next(err);
   }
-};
 
-module.exports.changeAvatar = async (req, res, next) => {
+  const confirmationToken = await ConfirmationToken.findOne({
+    token,
+    user: user._id,
+  });
+
+  if (!confirmationToken) {
+    return res.status(404).json({
+      success: false,
+      error: 'لینک تأیید نامعتبر یا منقضی شده است.',
+    });
+  }
+
+  // حذف توکن و تأیید کاربر
+  await Promise.all([
+    ConfirmationToken.deleteOne({ _id: confirmationToken._id }),
+    User.updateOne({ _id: user._id }, { confirmed: true }),
+  ]);
+
+  return res.status(200).json({
+    success: true,
+    message: 'ایمیل شما با موفقیت تأیید شد.',
+  });
+});
+
+// ============================================================
+// بخش ۸: مدیریت آواتار
+// ============================================================
+
+/**
+ * @function changeAvatar
+ * @description تغییر آواتار کاربر با آپلود در Cloudinary
+ * @route POST /api/users/avatar
+ */
+module.exports.changeAvatar = asyncHandler(async (req, res) => {
   const user = res.locals.user;
 
   if (!req.file) {
-    return res
-      .status(400)
-      .send({ error: 'Please provide the image to upload.' });
+    return res.status(400).json({
+      success: false,
+      error: 'لطفاً یک تصویر برای آپلود انتخاب کنید.',
+    });
   }
 
-  cloudinary.config({
-    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-    api_key: process.env.CLOUDINARY_API_KEY,
-    api_secret: process.env.CLOUDINARY_API_SECRET,
+  // آپلود تصویر در Cloudinary
+  const response = await cloudinary.uploader.upload(req.file.path, {
+    width: 200,
+    height: 200,
+    gravity: 'face',
+    crop: 'thumb',
   });
 
-  try {
-    const response = await cloudinary.uploader.upload(req.file.path, {
-      width: 200,
-      height: 200,
-      gravity: 'face',
-      crop: 'thumb',
-    });
+  // حذف فایل موقت
+  if (req.file.path) {
     fs.unlinkSync(req.file.path);
-
-    const avatarUpdate = await User.updateOne(
-      { _id: user._id },
-      { avatar: response.secure_url }
-    );
-
-    if (!avatarUpdate.nModified) {
-      throw new Error('Could not update user avatar.');
-    }
-
-    return res.send({ avatar: response.secure_url });
-  } catch (err) {
-    next(err);
   }
-};
 
-module.exports.removeAvatar = async (req, res, next) => {
+  // به‌روزرسانی آواتار کاربر
+  const avatarUpdate = await User.updateOne(
+    { _id: user._id },
+    { avatar: response.secure_url }
+  );
+
+  if (avatarUpdate.modifiedCount === 0) {
+    return res.status(500).json({
+      success: false,
+      error: 'آپلود تصویر با مشکل مواجه شد.',
+    });
+  }
+
+  return res.status(200).json({
+    success: true,
+    data: { avatar: response.secure_url },
+  });
+});
+
+/**
+ * @function removeAvatar
+ * @description حذف آواتار کاربر
+ * @route DELETE /api/users/avatar
+ */
+module.exports.removeAvatar = asyncHandler(async (req, res) => {
   const user = res.locals.user;
 
-  try {
-    const avatarUpdate = await User.updateOne(
-      { _id: user._id },
-      { $unset: { avatar: '' } }
-    );
-    if (!avatarUpdate.nModified) {
-      next(err);
-    }
-    return res.status(204).send();
-  } catch (err) {
-    next(err);
-  }
-};
+  const avatarUpdate = await User.updateOne(
+    { _id: user._id },
+    { $unset: { avatar: '' } }
+  );
 
-module.exports.updateProfile = async (req, res, next) => {
+  if (avatarUpdate.modifiedCount === 0) {
+    return res.status(404).json({
+      success: false,
+      error: 'آواتاری برای حذف یافت نشد.',
+    });
+  }
+
+  return res.status(204).send();
+});
+
+// ============================================================
+// بخش ۹: به‌روزرسانی پروفایل
+// ============================================================
+
+/**
+ * @function updateProfile
+ * @description به‌روزرسانی اطلاعات پروفایل کاربر
+ * @route PUT /api/users/profile
+ */
+module.exports.updateProfile = asyncHandler(async (req, res) => {
   const user = res.locals.user;
   const { fullName, username, website, bio, email } = req.body;
-  let confirmationToken = undefined;
-  let updatedFields = {};
-  try {
-    const userDocument = await User.findOne({ _id: user._id });
 
-    if (fullName) {
-      const fullNameError = validateFullName(fullName);
-      if (fullNameError) return res.status(400).send({ error: fullNameError });
-      userDocument.fullName = fullName;
-      updatedFields.fullName = fullName;
-    }
+  const userDocument = await User.findById(user._id);
+  const updatedFields = {};
+  let confirmationToken = null;
 
-    if (username) {
-      const usernameError = validateUsername(username);
-      if (usernameError) return res.status(400).send({ error: usernameError });
-      // Make sure the username to update to is not the current one
-      if (username !== user.username) {
-        const existingUser = await User.findOne({ username });
-        if (existingUser)
-          return res
-            .status(400)
-            .send({ error: 'Please choose another username.' });
-        userDocument.username = username;
-        updatedFields.username = username;
-      }
-    }
-
-    if (website) {
-      const websiteError = validateWebsite(website);
-      if (websiteError) return res.status(400).send({ error: websiteError });
-      if (!website.includes('http://') && !website.includes('https://')) {
-        userDocument.website = 'https://' + website;
-        updatedFields.website = 'https://' + website;
-      } else {
-        userDocument.website = website;
-        updatedFields.website = website;
-      }
-    }
-
-    if (bio) {
-      const bioError = validateBio(bio);
-      if (bioError) return res.status(400).send({ error: bioError });
-      userDocument.bio = bio;
-      updatedFields.bio = bio;
-    }
-
-    if (email) {
-      const emailError = validateEmail(email);
-      if (emailError) return res.status(400).send({ error: emailError });
-      // Make sure the email to update to is not the current one
-      if (email !== user.email) {
-        const existingUser = await User.findOne({ email });
-        if (existingUser)
-          return res
-            .status(400)
-            .send({ error: 'Please choose another email.' });
-        confirmationToken = new ConfirmationToken({
-          user: user._id,
-          token: crypto.randomBytes(20).toString('hex'),
-        });
-        await confirmationToken.save();
-        userDocument.email = email;
-        userDocument.confirmed = false;
-        updatedFields = { ...updatedFields, email, confirmed: false };
-      }
-    }
-    const updatedUser = await userDocument.save();
-    res.send(updatedFields);
-    if (email && email !== user.email) {
-      sendConfirmationEmail(
-        updatedUser.username,
-        updatedUser.email,
-        confirmationToken.token
-      );
-    }
-  } catch (err) {
-    next(err);
+  // اعتبارسنجی و به‌روزرسانی فیلدها
+  if (fullName !== undefined) {
+    const fullNameError = validateFullName(fullName);
+    if (fullNameError) return res.status(400).json({ success: false, error: fullNameError });
+    userDocument.fullName = fullName;
+    updatedFields.fullName = fullName;
   }
-};
 
-module.exports.retrieveSuggestedUsers = async (req, res, next) => {
-  const { max } = req.params;
+  if (username !== undefined) {
+    const usernameError = validateUsername(username);
+    if (usernameError) return res.status(400).json({ success: false, error: usernameError });
+    if (username !== user.username) {
+      const existingUser = await User.findOne({ username });
+      if (existingUser) return res.status(400).json({ success: false, error: 'این نام کاربری قبلاً انتخاب شده است.' });
+      userDocument.username = username;
+      updatedFields.username = username;
+    }
+  }
+
+  if (website !== undefined) {
+    const websiteError = validateWebsite(website);
+    if (websiteError) return res.status(400).json({ success: false, error: websiteError });
+    // افزودن پروتکل در صورت نیاز
+    const formattedWebsite = website.includes('http') ? website : `https://${website}`;
+    userDocument.website = formattedWebsite;
+    updatedFields.website = formattedWebsite;
+  }
+
+  if (bio !== undefined) {
+    const bioError = validateBio(bio);
+    if (bioError) return res.status(400).json({ success: false, error: bioError });
+    userDocument.bio = bio;
+    updatedFields.bio = bio;
+  }
+
+  if (email !== undefined) {
+    const emailError = validateEmail(email);
+    if (emailError) return res.status(400).json({ success: false, error: emailError });
+    if (email !== user.email) {
+      const existingUser = await User.findOne({ email });
+      if (existingUser) return res.status(400).json({ success: false, error: 'این ایمیل قبلاً ثبت شده است.' });
+
+      confirmationToken = await ConfirmationToken.create({
+        user: user._id,
+        token: crypto.randomBytes(20).toString('hex'),
+      });
+      userDocument.email = email;
+      userDocument.confirmed = false;
+      updatedFields.email = email;
+      updatedFields.confirmed = false;
+    }
+  }
+
+  if (Object.keys(updatedFields).length === 0) {
+    return res.status(400).json({ success: false, error: 'هیچ فیلدی برای به‌روزرسانی ارسال نشده است.' });
+  }
+
+  await userDocument.save();
+
+  // ارسال ایمیل تأیید در صورت تغییر ایمیل
+  if (confirmationToken) {
+    await sendConfirmationEmail(userDocument.username, userDocument.email, confirmationToken.token);
+  }
+
+  return res.status(200).json({
+    success: true,
+    data: updatedFields,
+    message: 'پروفایل با موفقیت به‌روزرسانی شد.',
+  });
+});
+
+// ============================================================
+// بخش ۱۰: دریافت کاربران پیشنهادی
+// ============================================================
+
+/**
+ * @function retrieveSuggestedUsers
+ * @description دریافت لیست کاربران پیشنهادی برای دنبال کردن
+ * @route GET /api/users/suggested?max=20
+ */
+module.exports.retrieveSuggestedUsers = asyncHandler(async (req, res) => {
+  const { max = 20 } = req.query;
   const user = res.locals.user;
-  try {
-    const users = await User.aggregate([
-      {
-        $match: { _id: { $ne: ObjectId(user._id) } },
+
+  const users = await User.aggregate([
+    {
+      $match: { _id: { $ne: ObjectId(user._id) } },
+    },
+    {
+      $lookup: {
+        from: 'followers',
+        localField: '_id',
+        foreignField: 'user',
+        pipeline: [{ $project: { _id: 1, followers: 1 } }],
+        as: 'followersData',
       },
-      {
-        $lookup: {
-          from: 'followers',
-          localField: '_id',
-          foreignField: 'user',
-          as: 'followers',
-        },
+    },
+    {
+      $lookup: {
+        from: 'posts',
+        let: { userId: '$_id' },
+        pipeline: [
+          { $match: { $expr: { $eq: ['$author', '$$userId'] } } },
+          { $sort: { createdAt: -1 } },
+          { $limit: 3 },
+        ],
+        as: 'posts',
       },
-      {
-        $lookup: {
-          from: 'posts',
-          let: { userId: '$_id' },
-          pipeline: [
-            {
-              $match: {
-                $expr: {
-                  $eq: ['$author', '$$userId'],
-                },
-              },
-            },
-            {
-              $sort: { date: -1 },
-            },
-            {
-              $limit: 3,
-            },
-          ],
-          as: 'posts',
-        },
+    },
+    {
+      $addFields: {
+        isFollowing: { $in: [user._id, '$followersData.followers.user'] },
       },
-      {
-        $unwind: '$followers',
+    },
+    { $match: { isFollowing: false } },
+    { $sample: { size: Math.min(Number(max), 50) } },
+    { $sort: { 'posts.length': -1 } },
+    {
+      $project: {
+        username: 1,
+        fullName: 1,
+        avatar: 1,
+        posts: 1,
       },
-      {
-        $project: {
-          username: true,
-          fullName: true,
-          email: true,
-          avatar: true,
-          isFollowing: { $in: [user._id, '$followers.followers.user'] },
-          posts: true,
-        },
-      },
-      {
-        $match: { isFollowing: false },
-      },
-      {
-        $sample: { size: max ? Number(max) : 20 },
-      },
-      {
-        $sort: { posts: -1 },
-      },
-      {
-        $unset: ['isFollowing'],
-      },
-    ]);
-    res.send(users);
-  } catch (err) {
-    next(err);
-  }
-};
+    },
+  ]);
+
+  return res.status(200).json({
+    success: true,
+    data: users,
+  });
+});
+
+module.exports = exports;
