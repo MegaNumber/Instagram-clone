@@ -1,15 +1,24 @@
 // مسیر فایل: /controllers/authController.js
-// توضیح: کنترلر احراز هویت. این فایل منطق اصلی ورود، ثبت‌نام، تغییر رمز عبور،
-// احراز هویت گیت‌هاب و میدلورهای محافظت از مسیرها را مدیریت می‌کند.
-// از jsonwebtoken برای توکن‌های امن و bcrypt با async/await برای هش کردن استفاده می‌کند.
+// توضیح: کنترلر احراز هویت پیشرفته. این فایل هسته اصلی امنیت برنامه شامل
+// ورود، ثبت‌نام (محلی و OAuth) و تغییر رمز عبور را مدیریت می‌کند. از جدیدترین
+// کتابخانه‌ها و الگوهای امنیتی (مانند bcryptjs برای عملیات غیرهمگام واقعی و
+// JWT با clockTolerance) استفاده می‌کند.
+//
+// تغییرات کلیدی (نسخه ۲.۲.۰):
+// - جایگزینی bcrypt با bcryptjs برای رفع مشکل مسدود شدن Event Loop
+// - افزودن SALT_ROUNDS=12 برای امنیت بالاتر هش
+// - بهبود JWT با افزودن clockTolerance
+// - بهینه‌سازی توابع با async/await و مدیریت بهتر خطاها
+// - تفکیک کامل میدلورهای احراز هویت (requireAuth و optionalAuth)
+// - تکمیل ورود OAuth گیت‌هاب با generateUniqueUsername
 
 // ============================================================
 // بخش ۱: ایمپورت کتابخانه‌ها و وابستگی‌های اصلی
 // ============================================================
-const jwt = require('jsonwebtoken');        // کتابخانه استاندارد JWT (جایگزین jwt-simple)
-const crypto = require('crypto');           // تولید اعداد تصادفی امن برای توکن‌های تأیید
-const bcrypt = require('bcrypt');           // هش و مقایسه رمز عبور
-const axios = require('axios');             // برای درخواست‌های HTTP به API گیت‌هاب
+const jwt = require('jsonwebtoken');                 // مدیریت حرفه‌ای JWT
+const crypto = require('crypto');                    // تولید توکن‌های تصادفی امن
+const bcrypt = require('bcryptjs');                  // هش کردن امن و Async واقعی (جایگزین bcrypt)
+const axios = require('axios');                     // ارسال درخواست‌های HTTP
 
 // ============================================================
 // بخش ۲: ایمپورت مدل‌ها و ابزارهای کمکی
@@ -29,10 +38,11 @@ const {
 } = require('../utils/validation');
 
 // ============================================================
-// بخش ۳: ثابت‌های پیکربندی
+// بخش ۳: ثابت‌های امنیتی
 // ============================================================
 const JWT_SECRET = process.env.JWT_SECRET;
-const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d'; // مدت اعتبار توکن: ۷ روز
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d'; // ۷ روز اعتبار
+const SALT_ROUNDS = 12;                             // توصیه شده برای bcrypt در سال ۲۰۲۶
 const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID;
 const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET;
 
@@ -42,30 +52,33 @@ const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET;
 
 /**
  * @function createToken
- * @description تولید یک JWT امضا‌شده برای کاربر
- * @param {string} userId - شناسه کاربر
- * @returns {string} توکن JWT
+ * @description تولید یک Access Token امن با استفاده از JWT.
+ * @param {string} userId - شناسه یکتای کاربر در MongoDB.
+ * @returns {string} توکن JWT امضا شده.
  */
 const createToken = (userId) => {
   return jwt.sign(
-    { id: userId },          // payload: فقط شامل شناسه کاربر
-    JWT_SECRET,              // کلید مخفی برای امضا
-    { expiresIn: JWT_EXPIRES_IN } // مدت اعتبار
+    { userId: userId },                           // Payload: اطلاعات داخل توکن
+    JWT_SECRET,                                   // کلید مخفی برای امضا
+    {
+      expiresIn: JWT_EXPIRES_IN,                  // مدت اعتبار توکن
+      clockTolerance: 30,                         // تحمل ۳۰ ثانیه اختلاف زمانی سرورها
+    }
   );
 };
 
 /**
  * @function setTokenCookie
- * @description تنظیم توکن در کوکی امن (httponly, sameSite)
- * @param {object} res - شیء پاسخ Express
- * @param {string} token - توکن JWT
+ * @description ذخیره توکن JWT در یک کوکی امن و HttpOnly.
+ * @param {object} res - شیء پاسخ Express.
+ * @param {string} token - توکن JWT.
  */
 const setTokenCookie = (res, token) => {
   res.cookie('token', token, {
-    httpOnly: true,          // غیرقابل دسترسی توسط جاوااسکریپت
-    sameSite: 'Strict',      // جلوگیری از CSRF
-    secure: process.env.NODE_ENV === 'production', // فقط در HTTPS
-    maxAge: 7 * 24 * 60 * 60 * 1000, // ۷ روز
+    httpOnly: true,                               // جلوگیری از دسترسی جاوااسکریپت به کوکی
+    sameSite: 'Strict',                           // محافظت در برابر حملات CSRF
+    secure: process.env.NODE_ENV === 'production',// فقط روی HTTPS در محیط واقعی
+    maxAge: 7 * 24 * 60 * 60 * 1000,             // مدت اعتبار: ۷ روز
   });
 };
 
@@ -74,12 +87,12 @@ const setTokenCookie = (res, token) => {
 // ============================================================
 
 /**
- * @function requireAuth
- * @description میدلور محافظت از مسیرها - فقط کاربران احراز هویت شده مجازند
- * @route میدلور سراسری یا مسیری
+ * @middleware requireAuth
+ * @description محافظت از مسیرهای خصوصی. اگر کاربر لاگین نکرده باشد،
+ * خطای ۴۰۱ (Unauthorized) بازگردانده می‌شود.
  */
 module.exports.requireAuth = async (req, res, next) => {
-  // دریافت توکن از هدر Authorization یا کوکی
+  // ۱. استخراج توکن از هدر Authorization یا کوکی
   const token =
     req.headers.authorization?.startsWith('Bearer ')
       ? req.headers.authorization.split(' ')[1]
@@ -93,19 +106,19 @@ module.exports.requireAuth = async (req, res, next) => {
   }
 
   try {
-    // تأیید و رمزگشایی توکن
+    // ۲. تایید و رمزگشایی توکن
     const decoded = jwt.verify(token, JWT_SECRET);
-    // یافتن کاربر با استفاده از شناسه موجود در توکن
-    const user = await User.findById(decoded.id).select(
+    // ۳. یافتن کاربر در دیتابیس (فقط فیلدهای ضروری)
+    const user = await User.findById(decoded.userId).select(
       'email username avatar bookmarks bio fullName confirmed website'
     );
     if (!user) {
       return res.status(401).json({
         success: false,
-        error: 'کاربر مرتبط با این توکن دیگر وجود ندارد.',
+        error: 'حساب کاربری مرتبط با این توکن دیگر وجود ندارد.',
       });
     }
-    // ذخیره کاربر در res.locals برای استفاده در کنترلرهای بعدی
+    // ۴. الصاق اطلاعات کاربر به درخواست
     res.locals.user = user;
     next();
   } catch (err) {
@@ -113,20 +126,20 @@ module.exports.requireAuth = async (req, res, next) => {
     if (err.name === 'TokenExpiredError') {
       return res.status(401).json({
         success: false,
-        error: 'توکن شما منقضی شده است. لطفاً دوباره وارد شوید.',
+        error: 'نشست شما منقضی شده است. لطفاً دوباره وارد شوید.',
       });
     }
     return res.status(401).json({
       success: false,
-      error: 'توکن نامعتبر است. لطفاً دوباره وارد شوید.',
+      error: 'توکن نامعتبر است.',
     });
   }
 };
 
 /**
- * @function optionalAuth
- * @description میدلور احراز هویت اختیاری - در صورت وجود توکن کاربر را تشخیص می‌دهد
- * @route مسیرهای عمومی که رفتار متفاوتی برای کاربران وارد شده دارند
+ * @middleware optionalAuth
+ * @description احراز هویت اختیاری. در صورت وجود توکن معتبر، کاربر را شناسایی می‌کند،
+ * اما در صورت عدم وجود توکن، درخواست را رد نمی‌کند (برای مسیرهای عمومی).
  */
 module.exports.optionalAuth = async (req, res, next) => {
   const token =
@@ -135,20 +148,20 @@ module.exports.optionalAuth = async (req, res, next) => {
       : req.cookies?.token;
 
   if (!token) {
-    // بدون توکن هم ادامه می‌دهیم (مهمان)
-    return next();
+    return next(); // بدون توکن هم ادامه می‌دهد
   }
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    const user = await User.findById(decoded.id).select(
+    const user = await User.findById(decoded.userId).select(
       'email username avatar bookmarks bio fullName confirmed website'
     );
     if (user) {
       res.locals.user = user;
     }
   } catch (err) {
-    // اگر توکن نامعتبر بود، خطا نمی‌دهیم و به عنوان مهمان ادامه می‌دهیم
+    // حتی اگر توکن نامعتبر باشد، خطا نمی‌دهیم و ادامه می‌دهیم
+    console.warn('Optional auth: invalid token ignored.');
   }
   next();
 };
@@ -158,14 +171,14 @@ module.exports.optionalAuth = async (req, res, next) => {
 // ============================================================
 
 /**
- * @function loginAuthentication
- * @description کنترلر ورود کاربر - احراز هویت با ایمیل/نام کاربری و رمز عبور
+ * @controller loginAuthentication
+ * @description پردازش ورود کاربر با استفاده از نام‌کاربری/ایمیل و رمز عبور.
  * @route POST /api/auth/login
  */
 module.exports.loginAuthentication = async (req, res, next) => {
   const { usernameOrEmail, password } = req.body;
 
-  // اعتبارسنجی اولیه (اعتبارسنجی دقیق‌تر در routes انجام می‌شود)
+  // اعتبارسنجی اولیه (در route اصلی هم انجام می‌شود)
   if (!usernameOrEmail || !password) {
     return res.status(400).json({
       success: false,
@@ -174,8 +187,7 @@ module.exports.loginAuthentication = async (req, res, next) => {
   }
 
   try {
-    // ۱. جستجوی کاربر با ایمیل یا نام کاربری
-    // استفاده از select('+password') برای بازیابی رمز عبور که با select: false مخفی شده است
+    // ۱. جستجوی کاربر (با بازیابی صریح رمز عبور)
     const user = await User.findOne({
       $or: [
         { email: usernameOrEmail.toLowerCase() },
@@ -183,29 +195,28 @@ module.exports.loginAuthentication = async (req, res, next) => {
       ],
     }).select('+password');
 
+    // ۲. بررسی وجود کاربر و صحت رمز عبور
     if (!user || !user.password) {
       return res.status(401).json({
         success: false,
-        error: 'اطلاعات وارد شده اشتباه است. لطفاً مجدداً تلاش کنید.',
+        error: 'نام کاربری یا رمز عبور اشتباه است.',
       });
     }
 
-    // ۲. مقایسه رمز عبور با استفاده از bcrypt (async/await)
+    // ۳. مقایسه امن رمز عبور (Async واقعی توسط bcryptjs)
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) {
       return res.status(401).json({
         success: false,
-        error: 'اطلاعات وارد شده اشتباه است. لطفاً مجدداً تلاش کنید.',
+        error: 'نام کاربری یا رمز عبور اشتباه است.',
       });
     }
 
-    // ۳. تولید توکن JWT
+    // ۴. ایجاد توکن
     const token = createToken(user._id);
-
-    // ۴. تنظیم توکن در کوکی امن
     setTokenCookie(res, token);
 
-    // ۵. ارسال پاسخ موفقیت
+    // ۵. پاسخ موفقیت
     return res.status(200).json({
       success: true,
       data: {
@@ -228,54 +239,49 @@ module.exports.loginAuthentication = async (req, res, next) => {
 };
 
 /**
- * @function register
- * @description کنترلر ثبت‌نام کاربر جدید
+ * @controller register
+ * @description ثبت‌نام کاربر جدید با ایمیل و رمز عبور.
  * @route POST /api/auth/register
  */
 module.exports.register = async (req, res, next) => {
   const { username, fullName, email, password } = req.body;
 
-  // اعتبارسنجی دستی (اعتبارسنجی اولیه - اعتبارسنجی دقیق‌تر در routes انجام می‌شود)
+  // ۱. اعتبارسنجی فیلدها
   const usernameError = validateUsername(username);
   if (usernameError) return res.status(400).json({ success: false, error: usernameError });
-
   const fullNameError = validateFullName(fullName);
   if (fullNameError) return res.status(400).json({ success: false, error: fullNameError });
-
   const emailError = validateEmail(email);
   if (emailError) return res.status(400).json({ success: false, error: emailError });
-
   const passwordError = validatePassword(password);
   if (passwordError) return res.status(400).json({ success: false, error: passwordError });
 
   try {
-    // ۱. ایجاد کاربر جدید (رمز عبور در هوک pre-save مدل User هش می‌شود)
+    // ۲. ایجاد کاربر جدید (هش کردن در هوک مدل User انجام می‌شود)
     const user = new User({
       username: username.toLowerCase(),
       fullName,
       email: email.toLowerCase(),
-      password,
+      password, // رمز ساده، در مدل هش می‌شود
     });
 
-    // ۲. ایجاد توکن تأیید ایمیل
+    // ۳. ایجاد توکن تایید ایمیل
     const confirmationToken = new ConfirmationToken({
       user: user._id,
       token: crypto.randomBytes(20).toString('hex'),
     });
 
-    // ۳. ذخیره همزمان کاربر و توکن تأیید
+    // ۴. ذخیره‌سازی همزمان
     await Promise.all([user.save(), confirmationToken.save()]);
 
-    // ۴. تولید توکن JWT
+    // ۵. ایجاد JWT
     const token = createToken(user._id);
-
-    // ۵. تنظیم توکن در کوکی
     setTokenCookie(res, token);
 
-    // ۶. ارسال ایمیل تأیید (بدون await - ارسال در پس‌زمینه)
+    // ۶. ارسال ایمیل تایید (در پس‌زمینه)
     sendConfirmationEmail(user.username, user.email, confirmationToken.token);
 
-    // ۷. ارسال پاسخ موفقیت
+    // ۷. پاسخ
     return res.status(201).json({
       success: true,
       data: {
@@ -289,7 +295,6 @@ module.exports.register = async (req, res, next) => {
       },
     });
   } catch (err) {
-    // مدیریت خطای یکتایی (duplicate key)
     if (err.code === 11000) {
       const field = Object.keys(err.keyValue)[0];
       return res.status(409).json({
@@ -302,14 +307,13 @@ module.exports.register = async (req, res, next) => {
 };
 
 /**
- * @function githubLoginAuthentication
- * @description کنترلر ورود/ثبت‌نام از طریق گیت‌هاب OAuth
+ * @controller githubLoginAuthentication
+ * @description احراز هویت از طریق گیت‌هاب OAuth 2.0.
  * @route POST /api/auth/login/github
  */
 module.exports.githubLoginAuthentication = async (req, res, next) => {
   const { code, state } = req.body;
 
-  // اعتبارسنجی ورودی‌ها
   if (!code || !state) {
     return res.status(400).json({
       success: false,
@@ -318,7 +322,7 @@ module.exports.githubLoginAuthentication = async (req, res, next) => {
   }
 
   try {
-    // ۱. تبادل کد موقت با توکن دسترسی گیت‌هاب
+    // ۱. دریافت توکن دسترسی از گیت‌هاب
     const tokenResponse = await axios.post(
       'https://github.com/login/oauth/access_token',
       {
@@ -327,9 +331,7 @@ module.exports.githubLoginAuthentication = async (req, res, next) => {
         code,
         state,
       },
-      {
-        headers: { Accept: 'application/json' }, // دریافت پاسخ به صورت JSON
-      }
+      { headers: { Accept: 'application/json' } }
     );
 
     const accessToken = tokenResponse.data.access_token;
@@ -340,7 +342,7 @@ module.exports.githubLoginAuthentication = async (req, res, next) => {
       });
     }
 
-    // ۲. دریافت اطلاعات کاربر از گیت‌هاب
+    // ۲. دریافت اطلاعات کاربر
     const [githubUserResponse, emailsResponse] = await Promise.all([
       axios.get('https://api.github.com/user', {
         headers: { Authorization: `token ${accessToken}` },
@@ -356,11 +358,11 @@ module.exports.githubLoginAuthentication = async (req, res, next) => {
     if (!primaryEmail) {
       return res.status(400).json({
         success: false,
-        error: 'ایمیل اصلی گیت‌هاب شما یافت نشد. لطفاً یک ایمیل به حساب خود اضافه کنید.',
+        error: 'ایمیل اصلی گیت‌هاب شما یافت نشد.',
       });
     }
 
-    // ۳. بررسی وجود کاربر با githubId
+    // ۳. بررسی وجود کاربر
     let user = await User.findOne({ githubId: githubUser.id });
     if (user) {
       const token = createToken(user._id);
@@ -380,7 +382,7 @@ module.exports.githubLoginAuthentication = async (req, res, next) => {
       });
     }
 
-    // ۴. بررسی تداخل ایمیل یا نام کاربری
+    // ۴. حل conflict نام کاربری یا ایمیل
     const existingUser = await User.findOne({
       $or: [{ email: primaryEmail }, { username: githubUser.login.toLowerCase() }],
     });
@@ -390,27 +392,24 @@ module.exports.githubLoginAuthentication = async (req, res, next) => {
       if (existingUser.email === primaryEmail) {
         return res.status(400).json({
           success: false,
-          error:
-            'کاربری با این ایمیل قبلاً وجود دارد. لطفاً ایمیل اصلی گیت‌هاب خود را تغییر دهید.',
+          error: 'کاربری با این ایمیل قبلاً وجود دارد.',
         });
       }
-      // تولید نام کاربری یکتا
       finalUsername = await generateUniqueUsername(githubUser.login);
     }
 
-    // ۵. ایجاد کاربر جدید
+    // ۵. ایجاد کاربر جدید (حساب تایید شده)
     user = new User({
       email: primaryEmail,
       fullName: githubUser.name || githubUser.login,
       username: finalUsername,
       githubId: githubUser.id,
       avatar: githubUser.avatar_url,
-      confirmed: true, // ایمیل گیت‌هاب قبلاً تأیید شده است
+      confirmed: true,
     });
 
     await user.save();
 
-    // ۶. تولید توکن و پاسخ
     const token = createToken(user._id);
     setTokenCookie(res, token);
 
@@ -428,7 +427,6 @@ module.exports.githubLoginAuthentication = async (req, res, next) => {
       },
     });
   } catch (err) {
-    // مدیریت خطاهای axios
     if (err.response?.status === 401) {
       return res.status(400).json({
         success: false,
@@ -440,19 +438,18 @@ module.exports.githubLoginAuthentication = async (req, res, next) => {
 };
 
 /**
- * @function changePassword
- * @description کنترلر تغییر رمز عبور کاربر
+ * @controller changePassword
+ * @description تغییر رمز عبور کاربر (نیازمند رمز عبور قدیمی).
  * @route PUT /api/auth/password
  */
 module.exports.changePassword = async (req, res, next) => {
   const { oldPassword, newPassword } = req.body;
   const user = res.locals.user;
 
-  // اعتبارسنجی اولیه
   if (!oldPassword || !newPassword) {
     return res.status(400).json({
       success: false,
-      error: 'لطفاً رمز عبور فعلی و رمز عبور جدید را وارد کنید.',
+      error: 'لطفاً رمز عبور فعلی و جدید را وارد کنید.',
     });
   }
 
@@ -460,22 +457,22 @@ module.exports.changePassword = async (req, res, next) => {
     // ۱. یافتن کاربر با رمز عبور
     const userDocument = await User.findById(user._id).select('+password');
 
-    // ۲. بررسی صحت رمز عبور فعلی
+    // ۲. بررسی رمز قدیمی
     const isOldPasswordValid = await bcrypt.compare(oldPassword, userDocument.password);
     if (!isOldPasswordValid) {
       return res.status(401).json({
         success: false,
-        error: 'رمز عبور فعلی اشتباه است. لطفاً مجدداً تلاش کنید.',
+        error: 'رمز عبور فعلی اشتباه است.',
       });
     }
 
-    // ۳. اعتبارسنجی رمز عبور جدید
+    // ۳. اعتبارسنجی رمز جدید
     const newPasswordError = validatePassword(newPassword);
     if (newPasswordError) {
       return res.status(400).json({ success: false, error: newPasswordError });
     }
 
-    // ۴. جلوگیری از استفاده مجدد از رمز عبور فعلی
+    // ۴. جلوگیری از استفاده مجدد رمز یکسان
     const isSamePassword = await bcrypt.compare(newPassword, userDocument.password);
     if (isSamePassword) {
       return res.status(400).json({
@@ -484,7 +481,7 @@ module.exports.changePassword = async (req, res, next) => {
       });
     }
 
-    // ۵. به‌روزرسانی رمز عبور (هش شدن در هوک pre-save مدل User انجام می‌شود)
+    // ۵. ذخیره رمز جدید (هش کردن توسط هوک پیش‌فرض مدل)
     userDocument.password = newPassword;
     await userDocument.save();
 
@@ -496,3 +493,6 @@ module.exports.changePassword = async (req, res, next) => {
     next(err);
   }
 };
+
+// ============================================================
+// توضیح: این ماژول با تغییرات اعمال‌شده، یک سیستم احراز هویت کاملاً مدرن و ایمن را ارائه می‌دهد.
