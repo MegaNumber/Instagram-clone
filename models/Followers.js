@@ -1,7 +1,12 @@
 // مسیر فایل: /models/Followers.js
-// توضیح: مدل Mongoose برای دنبال‌کنندگان. هر کاربر یک سند Followers دارد
-// که آرایه‌ای از کاربرانی که او را دنبال می‌کنند در آن ذخیره می‌شود.
-// این مدل برای پرس‌وجوی سریع و مدیریت دنبال‌کنندگان بهینه شده است.
+// توضیح: مدل Mongoose برای دنبال‌کنندگان. هر کاربر دقیقاً یک سند Followers دارد
+// که آرایه‌ای از کاربرانی که او را دنبال می‌کنند، در آن ذخیره می‌شود.
+// این مدل با اعتبارسنجی یکتایی، ایندکس‌های ترکیبی و یک متد استاتیک
+// برای افزودن/حذف دنبال‌کننده (toggleFollow)، برای کوئری‌های سریع
+// و مدیریت آسان بهینه شده است.
+//
+// @version 2.3.7
+// @since 2026
 
 // ============================================================
 // بخش ۱: ایمپورت ماژول‌های مورد نیاز
@@ -88,7 +93,47 @@ FollowersSchema.virtual('followerCount').get(function () {
 });
 
 // ============================================================
-// بخش ۶: تبدیل خروجی JSON
+// بخش ۶: متدهای استاتیک (کمکی)
+// ============================================================
+
+/**
+ * افزودن یا حذف یک دنبال‌کننده (Toggle Follow/Unfollow).
+ * اگر کاربر قبلاً دنبال کرده باشد، حذف می‌کند؛ در غیر این صورت اضافه می‌کند.
+ * @param {string} targetUserId - کاربری که می‌خواهیم دنبال/لغو دنبال کنیم (صاحب سند Followers)
+ * @param {string} followerId - کاربری که عمل دنبال کردن را انجام می‌دهد
+ * @returns {Promise<string>} - 'followed' یا 'unfollowed'
+ */
+FollowersSchema.statics.toggleFollow = async function (targetUserId, followerId) {
+    const result = await this.updateOne(
+        { user: targetUserId, 'followers.user': { $ne: followerId } },
+        { $push: { followers: { user: followerId } } }
+    );
+
+    if (result.modifiedCount === 1) {
+        return 'followed';
+    }
+
+    // قبلاً دنبال کرده بود، حذفش می‌کنیم
+    await this.updateOne(
+        { user: targetUserId },
+        { $pull: { followers: { user: followerId } } }
+    );
+    return 'unfollowed';
+};
+
+/**
+ * بررسی اینکه آیا کاربر خاصی توسط کاربر دیگری دنبال شده است
+ * @param {string} targetUserId
+ * @param {string} followerId
+ * @returns {Promise<boolean>}
+ */
+FollowersSchema.statics.isFollowedBy = async function (targetUserId, followerId) {
+    const doc = await this.findOne({ user: targetUserId, 'followers.user': followerId });
+    return !!doc;
+};
+
+// ============================================================
+// بخش ۷: تبدیل خروجی JSON
 // ============================================================
 FollowersSchema.set('toJSON', {
     transform: function (doc, ret) {
@@ -100,7 +145,7 @@ FollowersSchema.set('toJSON', {
 });
 
 // ============================================================
-// بخش ۷: ایجاد و صادرات مدل
+// بخش ۸: ایجاد و صادرات مدل
 // ============================================================
 const Followers = mongoose.model('Followers', FollowersSchema);
 module.exports = Followers;
