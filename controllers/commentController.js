@@ -1,354 +1,348 @@
+// مسیر فایل: /controllers/commentController.js
+// توضیح: کنترلر مدیریت نظرات و پاسخ‌ها. این فایل منطق ایجاد، حذف، رأی‌دهی و
+// بازیابی نظرات و پاسخ‌های آن‌ها را مدیریت می‌کند. همچنین شامل ارسال
+// نوتیفیکیشن‌های مربوط به کامنت و منشن‌ها است. از الگوی asyncHandler
+// برای حذف try-catch تکراری استفاده می‌کند.
+
+// ============================================================
+// بخش ۱: ایمپورت ماژول‌های مورد نیاز
+// ============================================================
+const mongoose = require('mongoose');
+const ObjectId = mongoose.Types.ObjectId;
+const sharp = require('sharp'); // برای تولید بندانگشتی نوتیفیکیشن
+const path = require('path');
+const fs = require('fs').promises;
+
 const Comment = require('../models/Comment');
 const CommentVote = require('../models/CommentVote');
 const CommentReply = require('../models/CommentReply');
 const CommentReplyVote = require('../models/CommentReplyVote');
 const Post = require('../models/Post');
-const ObjectId = require('mongoose').Types.ObjectId;
+const User = require('../models/User');
+const asyncHandler = require('../utils/asyncHandler');
+const socketHandler = require('../handlers/socketHandler');
 
 const {
   retrieveComments,
-  formatCloudinaryUrl,
   sendCommentNotification,
   sendMentionNotification,
 } = require('../utils/controllerUtils');
 
-module.exports.createComment = async (req, res, next) => {
+// ============================================================
+// بخش ۲: ثابت‌های پیکربندی
+// ============================================================
+const THUMB_SIZE = { width: 50, height: 50 }; // ابعاد بندانگشتی نوتیفیکیشن
+
+// ============================================================
+// بخش ۳: توابع کمکی
+// ============================================================
+
+/**
+ * @function generateNotificationThumbnail
+ * @description تولید نسخه‌ی بندانگشتی کوچک برای نوتیفیکیشن (۵۰×۵۰)
+ * @param {string} imagePath - مسیر فایل اصلی روی سرور (مثلاً public/uploads/xxx.jpg)
+ * @returns {Promise<string>} مسیر فایل بندانگشتی
+ */
+const generateNotificationThumbnail = async (imagePath) => {
+  const fullPath = path.join(__dirname, '..', imagePath);
+  const thumbPath = fullPath.replace(/(\.\w+)$/, '_notif_thumb$1');
+  try {
+    await sharp(fullPath)
+      .resize(THUMB_SIZE.width, THUMB_SIZE.height, { fit: 'cover' })
+      .jpeg({ quality: 70 })
+      .toFile(thumbPath);
+    // بازگرداندن مسیر نسبی از ریشه public
+    return thumbPath.replace(path.join(__dirname, '..', 'public'), '');
+  } catch (err) {
+    console.error('[generateNotificationThumbnail] خطا:', err.message);
+    // در صورت خطا، مسیر اصلی را برمی‌گردانیم
+    return imagePath;
+  }
+};
+
+// ============================================================
+// بخش ۴: کنترلر - ایجاد نظر (Create Comment)
+// ============================================================
+module.exports.createComment = asyncHandler(async (req, res) => {
   const { postId } = req.params;
   const { message } = req.body;
   const user = res.locals.user;
-  let post = undefined;
 
-  if (!message) {
-    return res
-      .status(400)
-      .send({ error: 'Please provide a message with your comment.' });
+  if (!message || !message.trim()) {
+    return res.status(400).json({ success: false, error: 'متن نظر نمی‌تواند خالی باشد.' });
   }
   if (!postId) {
-    return res.status(400).send({
-      error: 'Please provide the id of the post you would like to comment on.',
-    });
+    return res.status(400).json({ success: false, error: 'شناسه پست الزامی است.' });
   }
 
-  try {
-    post = await Post.findById(postId);
-    if (!post) {
-      return res
-        .status(404)
-        .send({ error: 'Could not find a post with that post id.' });
-    }
+  const post = await Post.findById(postId).select('_id author image thumbnail filter');
+  if (!post) {
+    return res.status(404).json({ success: false, error: 'پستی با این شناسه یافت نشد.' });
+  }
 
-    const comment = new Comment({ message, author: user._id, post: postId });
-    await comment.save();
-    res.status(201).send({
+  // ایجاد نظر
+  const comment = await Comment.create({
+    message: message.trim(),
+    author: user._id,
+    post: postId,
+  });
+
+  res.status(201).json({
+    success: true,
+    data: {
       ...comment.toObject(),
-      author: { username: user.username, avatar: user.avatar },
+      author: { _id: user._id, username: user.username, avatar: user.avatar },
       commentVotes: [],
+      commentReplies: 0,
+    },
+  });
+
+  // ارسال نوتیفیکیشن‌ها در پس‌زمینه (بدون await)
+  // ۱. نوتیفیکیشن کامنت به نویسنده پست
+  // تولید بندانگشتی مناسب برای نوتیفیکیشن
+  const notifThumb = await generateNotificationThumbnail(post.thumbnail || post.image);
+
+  sendCommentNotification(
+    req,
+    user,
+    post.author,
+    notifThumb,
+    post.filter,
+    message,
+    post._id
+  );
+
+  // ۲. نوتیفیکیشن منشن به کاربران تگ‌شده
+  // ابتدا اطلاعات کامل پست به همراه نویسنده را بگیر
+  const postWithAuthor = await Post.findById(post._id).populate('author', 'username avatar');
+  if (postWithAuthor) {
+    sendMentionNotification(req, message, notifThumb, postWithAuthor, user);
+  }
+});
+
+// ============================================================
+// بخش ۵: کنترلر - حذف نظر (Delete Comment)
+// ============================================================
+module.exports.deleteComment = asyncHandler(async (req, res) => {
+  const { commentId } = req.params;
+  const user = res.locals.user;
+
+  const comment = await Comment.findOne({ _id: commentId, author: user._id });
+  if (!comment) {
+    return res.status(404).json({
+      success: false,
+      error: 'نظری با این شناسه و متعلق به شما یافت نشد.',
     });
-  } catch (err) {
-    next(err);
   }
 
-  try {
-    // Sending comment notification
-    let image = formatCloudinaryUrl(
-      post.image,
-      { height: 50, width: 50, x: '100%', y: '100%' },
-      true
-    );
+  // حذف نظر (هوک‌های pre وظیفه حذف رأی‌ها و پاسخ‌ها را دارند)
+  const deleteResult = await Comment.deleteOne({ _id: commentId });
+  if (!deleteResult.deletedCount) {
+    return res.status(500).json({ success: false, error: 'حذف نظر با مشکل مواجه شد.' });
+  }
+
+  res.status(200).json({ success: true, message: 'نظر با موفقیت حذف شد.' });
+});
+
+// ============================================================
+// بخش ۶: کنترلر - رأی به نظر (Vote Comment)
+// ============================================================
+module.exports.voteComment = asyncHandler(async (req, res) => {
+  const { commentId } = req.params;
+  const user = res.locals.user;
+
+  // افزودن رأی
+  const addResult = await CommentVote.updateOne(
+    { comment: commentId, 'votes.author': { $ne: user._id } },
+    { $push: { votes: { author: user._id } } }
+  );
+
+  if (addResult.modifiedCount > 0) {
+    return res.status(200).json({ success: true, operation: 'like' });
+  }
+
+  // اگر رأی قبلاً وجود داشته، حذف می‌کنیم
+  const removeResult = await CommentVote.updateOne(
+    { comment: commentId },
+    { $pull: { votes: { author: user._id } } }
+  );
+
+  if (removeResult.modifiedCount === 0) {
+    return res.status(500).json({ success: false, error: 'عملیات رأی‌دهی با خطا مواجه شد.' });
+  }
+
+  return res.status(200).json({ success: true, operation: 'unlike' });
+});
+
+// ============================================================
+// بخش ۷: ایجاد پاسخ به نظر (Create Comment Reply)
+// ============================================================
+module.exports.createCommentReply = asyncHandler(async (req, res) => {
+  const { parentCommentId } = req.params;
+  const { message } = req.body;
+  const user = res.locals.user;
+
+  if (!message || !message.trim()) {
+    return res.status(400).json({ success: false, error: 'متن پاسخ نمی‌تواند خالی باشد.' });
+  }
+  if (!parentCommentId) {
+    return res.status(400).json({ success: false, error: 'شناسه نظر والد الزامی است.' });
+  }
+
+  const parentComment = await Comment.findById(parentCommentId).select('post');
+  if (!parentComment) {
+    return res.status(404).json({ success: false, error: 'نظر والد یافت نشد.' });
+  }
+
+  // ایجاد پاسخ
+  const commentReply = await CommentReply.create({
+    parentComment: parentCommentId,
+    message: message.trim(),
+    author: user._id,
+  });
+
+  res.status(201).json({
+    success: true,
+    data: {
+      ...commentReply.toObject(),
+      author: { _id: user._id, username: user.username, avatar: user.avatar },
+      commentReplyVotes: [],
+    },
+  });
+
+  // دریافت اطلاعات پست برای نوتیفیکیشن
+  const post = await Post.findById(parentComment.post)
+    .populate('author', 'username avatar')
+    .select('image thumbnail filter author');
+
+  if (post) {
+    const notifThumb = await generateNotificationThumbnail(post.thumbnail || post.image);
+
+    // نوتیفیکیشن به نویسنده پست
     sendCommentNotification(
       req,
       user,
-      post.author,
-      image,
+      post.author._id,
+      notifThumb,
       post.filter,
       message,
       post._id
     );
 
-    // Find the username of the post author
-    const postDocument = await Post.findById(post._id).populate('author');
-    image = formatCloudinaryUrl(
-      post.image,
-      { height: 50, width: 50, x: '100%', y: '100%' },
-      true
-    );
-
-    // Sending a mention notification
-    sendMentionNotification(req, message, image, postDocument, user);
-  } catch (err) {
-    console.log(err);
+    // نوتیفیکیشن منشن
+    sendMentionNotification(req, message, notifThumb, post, user);
   }
-};
+});
 
-module.exports.deleteComment = async (req, res, next) => {
-  const { commentId } = req.params;
-  const user = res.locals.user;
-  try {
-    const comment = await Comment.findOne({
-      _id: commentId,
-      author: user._id,
-    });
-    if (!comment) {
-      return res.status(404).send({
-        error:
-          'Could not find a comment with that id associated with the user.',
-      });
-    }
-
-    // This uses pre hooks to delete everything associated with this comment i.e replies
-    const commentDelete = await Comment.deleteOne({
-      _id: commentId,
-    });
-    if (!commentDelete.deletedCount) {
-      return res.status(500).send({ error: 'Could not delete the comment.' });
-    }
-    res.status(204).send();
-  } catch (err) {
-    next(err);
-  }
-};
-
-module.exports.voteComment = async (req, res, next) => {
-  const { commentId } = req.params;
-  const user = res.locals.user;
-
-  try {
-    const commentLikeUpdate = await CommentVote.updateOne(
-      {
-        comment: commentId,
-        'votes.author': { $ne: user._id },
-      },
-      { $push: { votes: { author: user._id } } }
-    );
-    if (!commentLikeUpdate.nModified) {
-      if (!commentLikeUpdate.ok) {
-        return res
-          .status(500)
-          .send({ error: 'Could not vote on the comment.' });
-      }
-      // Nothing was modified in the previous query meaning that the user has already liked the comment
-      // Remove the user's like
-      const commentDislikeUpdate = await CommentVote.updateOne(
-        { comment: commentId },
-        { $pull: { votes: { author: user._id } } }
-      );
-      if (!commentDislikeUpdate.nModified) {
-        return res
-          .status(500)
-          .send({ error: 'Could not vote on the comment.' });
-      }
-    }
-    return res.send({ success: true });
-  } catch (err) {
-    next(err);
-  }
-};
-
-module.exports.createCommentReply = async (req, res, next) => {
-  const { parentCommentId } = req.params;
-  const { message } = req.body;
-  const user = res.locals.user;
-
-  if (!message) {
-    return res
-      .status(400)
-      .send({ error: 'Please provide a message with your comment.' });
-  }
-  if (!parentCommentId) {
-    return res.status(400).send({
-      error: 'Please provide the id of the comment you would like to reply to.',
-    });
-  }
-
-  try {
-    const comment = await Comment.findById(parentCommentId);
-    if (!comment) {
-      return res
-        .status(404)
-        .send({ error: 'Could not find a parent comment with that id.' });
-    }
-    const commentReply = await new CommentReply({
-      parentComment: parentCommentId,
-      message,
-      author: user._id,
-    });
-
-    await commentReply.save();
-    res.status(201).send({
-      ...commentReply.toObject(),
-      author: { username: user.username, avatar: user.avatar },
-      commentReplyVotes: [],
-    });
-  } catch (err) {
-    next(err);
-  }
-
-  try {
-    // Sending comment notification
-    const parentCommentDocument = await Comment.findById(parentCommentId);
-    const postDocument = await Post.findById(
-      parentCommentDocument.post
-    ).populate('author');
-    const image = formatCloudinaryUrl(
-      postDocument.image,
-      {
-        height: 50,
-        width: 50,
-        x: '100%',
-        y: '100%',
-      },
-      true
-    );
-
-    sendCommentNotification(
-      req,
-      user,
-      postDocument.author._id,
-      image,
-      postDocument.filter,
-      message,
-      postDocument._id
-    );
-
-    sendMentionNotification(req, message, image, postDocument, user);
-  } catch (err) {
-    console.log(err);
-  }
-};
-
-module.exports.deleteCommentReply = async (req, res, next) => {
+// ============================================================
+// بخش ۸: حذف پاسخ نظر (Delete Comment Reply)
+// ============================================================
+module.exports.deleteCommentReply = asyncHandler(async (req, res) => {
   const { commentReplyId } = req.params;
   const user = res.locals.user;
 
-  try {
-    const commentReply = await CommentReply.findOne({
-      _id: commentReplyId,
-      author: user._id,
+  const reply = await CommentReply.findOne({ _id: commentReplyId, author: user._id });
+  if (!reply) {
+    return res.status(404).json({
+      success: false,
+      error: 'پاسخی با این شناسه و متعلق به شما یافت نشد.',
     });
-    if (!commentReply) {
-      return res.status(404).send({
-        error:
-          'Could not find a comment reply with that id associated with the user.',
-      });
-    }
+  }
 
-    const commentReplyDeletion = await CommentReply.deleteOne({
-      _id: commentReplyId,
-    });
-    if (!commentReplyDeletion.deletedCount) {
-      return res
-        .status(500)
-        .send({ error: 'Could not delete the comment reply.' });
-    }
-    return res.status(204).send();
-  } catch (err) {}
-};
+  await CommentReply.deleteOne({ _id: commentReplyId });
 
-module.exports.voteCommentReply = async (req, res, next) => {
+  res.status(200).json({ success: true, message: 'پاسخ با موفقیت حذف شد.' });
+});
+
+// ============================================================
+// بخش ۹: رأی به پاسخ نظر (Vote Comment Reply)
+// ============================================================
+module.exports.voteCommentReply = asyncHandler(async (req, res) => {
   const { commentReplyId } = req.params;
   const user = res.locals.user;
 
-  try {
-    const commentReplyLikeUpdate = await CommentReplyVote.updateOne(
-      {
-        comment: commentReplyId,
-        'votes.author': { $ne: user._id },
-      },
-      { $push: { votes: { author: user._id } } }
-    );
-    // Nothing was modified in the previous query meaning that the user has already liked the comment
-    // Remove the user's like
-    if (!commentReplyLikeUpdate.nModified) {
-      if (!commentReplyLikeUpdate.ok) {
-        return res
-          .status(500)
-          .send({ error: 'Could not vote on the comment reply.' });
-      }
-      const commentReplyDislikeUpdate = await CommentReplyVote.updateOne(
-        { comment: commentReplyId },
-        { $pull: { votes: { author: user._id } } }
-      );
-      if (!commentReplyDislikeUpdate.nModified) {
-        return res
-          .status(500)
-          .send({ error: 'Could not vote on the comment reply.' });
-      }
-    }
+  const addResult = await CommentReplyVote.updateOne(
+    { comment: commentReplyId, 'votes.author': { $ne: user._id } },
+    { $push: { votes: { author: user._id } } }
+  );
 
-    return res.send({ success: true });
-  } catch (err) {
-    next(err);
+  if (addResult.modifiedCount > 0) {
+    return res.status(200).json({ success: true, operation: 'like' });
   }
-};
 
-module.exports.retrieveCommentReplies = async (req, res, next) => {
+  const removeResult = await CommentReplyVote.updateOne(
+    { comment: commentReplyId },
+    { $pull: { votes: { author: user._id } } }
+  );
+
+  if (removeResult.modifiedCount === 0) {
+    return res.status(500).json({ success: false, error: 'عملیات رأی‌دهی با خطا مواجه شد.' });
+  }
+
+  return res.status(200).json({ success: true, operation: 'unlike' });
+});
+
+// ============================================================
+// بخش ۱۰: دریافت پاسخ‌های یک نظر (Retrieve Comment Replies)
+// ============================================================
+module.exports.retrieveCommentReplies = asyncHandler(async (req, res) => {
   const { parentCommentId, offset = 0 } = req.params;
 
-  try {
-    const comment = await Comment.findById(parentCommentId);
-    if (!comment) {
-      return res
-        .status(404)
-        .send({ error: 'Could not find a parent comment with that id.' });
-    }
+  const parentComment = await Comment.findById(parentCommentId).select('_id');
+  if (!parentComment) {
+    return res.status(404).json({ success: false, error: 'نظر والد یافت نشد.' });
+  }
 
-    const commentReplies = await CommentReply.aggregate([
-      { $match: { parentComment: ObjectId(parentCommentId) } },
-      { $sort: { date: -1 } },
-      { $skip: Number(offset) },
-      { $limit: 3 },
-      {
-        $lookup: {
-          from: 'commentreplyvotes',
-          localField: '_id',
-          foreignField: 'comment',
-          as: 'commentReplyVotes',
-        },
+  const replies = await CommentReply.aggregate([
+    { $match: { parentComment: ObjectId(parentCommentId) } },
+    { $sort: { createdAt: -1 } },
+    { $skip: Number(offset) },
+    { $limit: 3 },
+    {
+      $lookup: {
+        from: 'commentreplyvotes',
+        localField: '_id',
+        foreignField: 'comment',
+        as: 'commentReplyVotes',
       },
-      { $unwind: '$commentReplyVotes' },
-      {
-        $lookup: {
-          from: 'users',
-          localField: 'author',
-          foreignField: '_id',
-          as: 'author',
-        },
-      },
-      {
-        $unwind: '$author',
-      },
-      {
-        $unset: [
-          'author.private',
-          'author.password',
-          'author.bookmarks',
-          'author.email',
+    },
+    { $unwind: { path: '$commentReplyVotes', preserveNullAndEmptyArrays: true } },
+    {
+      $lookup: {
+        from: 'users',
+        localField: 'author',
+        foreignField: '_id',
+        pipeline: [
+          { $project: { username: 1, avatar: 1 } },
         ],
+        as: 'author',
       },
-      {
-        $addFields: {
-          commentReplyVotes: '$commentReplyVotes.votes',
-        },
+    },
+    { $unwind: { path: '$author', preserveNullAndEmptyArrays: true } },
+    {
+      $addFields: {
+        commentReplyVotes: { $ifNull: ['$commentReplyVotes.votes', []] },
       },
-    ]);
+    },
+  ]);
 
-    if (commentReplies.length === 0) {
-      return res.status(404).send({
-        error: 'Could not find any replies for the specified comment.',
-      });
-    }
-    return res.send(commentReplies);
-  } catch (err) {
-    next(err);
+  if (replies.length === 0) {
+    return res.status(404).json({
+      success: false,
+      error: 'پاسخی برای این نظر یافت نشد.',
+    });
   }
-};
 
-module.exports.retrieveComments = async (req, res, next) => {
+  return res.status(200).json({ success: true, data: replies });
+});
+
+// ============================================================
+// بخش ۱۱: دریافت نظرات یک پست (Retrieve Comments) – صرفاً واسط
+// ============================================================
+module.exports.retrieveComments = asyncHandler(async (req, res) => {
   const { postId, offset, exclude } = req.params;
-  try {
-    const comments = await retrieveComments(postId, offset, exclude);
-    return res.send(comments);
-  } catch (err) {
-    next(err);
-  }
-};
+  const comments = await retrieveComments(postId, offset, exclude);
+  return res.status(200).json({ success: true, data: comments });
+});
+
+module.exports = exports;
