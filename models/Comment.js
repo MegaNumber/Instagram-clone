@@ -2,7 +2,10 @@
 // توضیح: مدل Mongoose برای نظرات. این فایل ساختار یک نظر (کامنت) را همراه با
 // نویسنده، پست مرجع، کاربران منشن‌شده، و هوک‌های لازم برای ایجاد سند رأی و
 // حذف آبشاری تعریف می‌کند. همچنین ایندکس‌های بهینه برای نمایش سریع نظرات
-// و فیلدهای مجازی برای تعداد لایک‌ها و پاسخ‌ها را فراهم می‌کند.
+// (طبق قانون ESR) و فیلدهای مجازی برای تعداد لایک‌ها و پاسخ‌ها را فراهم می‌کند.
+//
+// @version 2.3.3
+// @since 2026
 
 // ============================================================
 // بخش ۱: ایمپورت ماژول‌های مورد نیاز
@@ -149,20 +152,41 @@ CommentSchema.virtual('replyCount', {
 });
 
 // ============================================================
-// بخش ۷: تبدیل خروجی JSON
+// بخش ۷: متدهای استاتیک (کمکی)
+// ============================================================
+
+/**
+ * دریافت صفحه‌بندی‌شده نظرات یک پست
+ * @param {string} postId - شناسه پست
+ * @param {object} options - { page, limit }
+ * @returns {Promise<{comments: Array, total: number}>}
+ */
+CommentSchema.statics.findByPostPaginated = async function (postId, { page = 1, limit = 10 } = {}) {
+    const skip = (page - 1) * limit;
+    const [comments, total] = await Promise.all([
+        this.find({ post: postId })
+            .sort({ createdAt: 1 })
+            .skip(skip)
+            .limit(limit)
+            .lean(),
+        this.countDocuments({ post: postId }),
+    ]);
+    return { comments, total };
+};
+
+// ============================================================
+// بخش ۸: تبدیل خروجی JSON
 // ============================================================
 CommentSchema.set('toJSON', {
     transform: function (doc, ret) {
         ret.id = ret._id;
         delete ret.__v;
-        // برای سازگاری با کدهای قدیمی‌تر (در صورت نیاز)
-        // ret.date = ret.createdAt;
         return ret;
     },
 });
 
 // ============================================================
-// بخش ۸: ایجاد و صادرات مدل
+// بخش ۹: ایجاد و صادرات مدل
 // ============================================================
 const Comment = mongoose.model('Comment', CommentSchema);
 module.exports = Comment;
