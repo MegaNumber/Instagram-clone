@@ -1,26 +1,65 @@
-version: '3.3'
+# مسیر فایل: /docker-compose.yml
+# توضیح: فایل Docker Compose برای راه‌اندازی بک‌اند و پایگاه داده MongoDB
+# به همراه شبکه و Volume اختصاصی. مناسب برای توسعه و تولید.
+
+version: '3.8'
 
 services:
-  instaclone-backend:
-    depends_on:
-      - mongo
-    stdin_open: true
-    container_name: instaclone-backend
-    restart: always
-    build:
-      context: .
-      dockerfile: Dockerfile
-    ports:
-      - 9000:9000
-    environment:
-      CHOKIDAR_USEPOLLING: 'true'
+  # ======================================
+  # سرویس پایگاه داده MongoDB
+  # ======================================
   mongo:
-    image: mongo
-    container_name: mongo
-    restart: always
+    image: mongo:6.0
+    container_name: instaclone-mongo
+    restart: unless-stopped
     environment:
       MONGO_INITDB_DATABASE: instaclone
     volumes:
-      - ~/mongo/data:/data/db
+      - mongo-data:/data/db
+    networks:
+      - instaclone-network
+    # (اختیاری) اگر می‌خواهید از خارج به MongoDB دسترسی داشته باشید:
+    # ports:
+    #   - "27017:27017"
+
+  # ======================================
+  # سرویس بک‌اند (Node.js)
+  # ======================================
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: instaclone-backend
+    restart: unless-stopped
     ports:
-      - 27017:27017
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - MONGO_URI=mongodb://mongo:27017/instaclone
+      - PORT=5000
+    depends_on:
+      - mongo
+    networks:
+      - instaclone-network
+    volumes:
+      # برای توسعه می‌توانید کد را mount کنید (اختیاری)
+      # - ./:/usr/src/app
+      # - /usr/src/app/node_modules
+      # برای ذخیره دائمی فایل‌های آپلودشده
+      - uploads-data:/usr/src/app/public/uploads
+
+# ======================================
+# تعریف Volume ها
+# ======================================
+volumes:
+  mongo-data:
+  uploads-data:
+
+# ======================================
+# تعریف شبکه
+# ======================================
+networks:
+  instaclone-network:
+    driver: bridge
