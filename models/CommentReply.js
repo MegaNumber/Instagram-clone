@@ -1,62 +1,140 @@
+// مسیر فایل: /models/CommentReply.js
+// توضیح: مدل Mongoose برای پاسخ‌های نظرات (Comment Replies). این فایل ساختار یک پاسخ
+// به یک نظر را تعریف می‌کند و شامل هوک‌های ایجاد خودکار سند رأی و حذف آبشاری رأی
+// در هنگام حذف پاسخ است. ایندکس‌های بهینه برای نمایش مرتب پاسخ‌ها نیز تعبیه شده است.
+
+// ============================================================
+// بخش ۱: ایمپورت ماژول‌های مورد نیاز
+// ============================================================
 const mongoose = require('mongoose');
 const Schema = mongoose.Schema;
 
-const CommentReplySchema = new Schema({
-  parentComment: {
-    type: Schema.ObjectId,
-    ref: 'Comment',
-  },
-  date: {
-    type: Date,
-    default: Date.now,
-  },
-  message: String,
-  author: {
-    type: Schema.ObjectId,
-    ref: 'User',
-  },
-});
+// ============================================================
+// بخش ۲: ثابت‌های پیکربندی
+// ============================================================
+const MESSAGE_MAX_LENGTH = 2000; // حداکثر طول متن پاسخ
 
-CommentReplySchema.pre('deleteMany', async function (next) {
-  const parentCommentId = this.getQuery()['parentComment'];
-  try {
-    const commentReply = await mongoose
-      .model('CommentReply')
-      .findOne({ parentComment: parentCommentId });
-    if (commentReply) {
-      await mongoose
-        .model('CommentReplyVote')
-        .deleteOne({ comment: commentReply._id });
+// ============================================================
+// بخش ۳: تعریف طرحواره پاسخ نظر (CommentReply Schema)
+// ============================================================
+const CommentReplySchema = new Schema(
+    {
+        // ---------- متن پاسخ ----------
+        message: {
+            type: String,
+            required: [true, 'متن پاسخ نمی‌تواند خالی باشد.'],
+            trim: true,
+            maxlength: [MESSAGE_MAX_LENGTH, `متن پاسخ نمی‌تواند بیشتر از ${MESSAGE_MAX_LENGTH} کاراکتر باشد.`],
+        },
+        // ---------- نویسنده پاسخ ----------
+        author: {
+            type: Schema.Types.ObjectId,
+            ref: 'User',
+            required: [true, 'نویسنده پاسخ الزامی است.'],
+            index: true,
+        },
+        // ---------- نظر والد ----------
+        parentComment: {
+            type: Schema.Types.ObjectId,
+            ref: 'Comment',
+            required: [true, 'نظر والد الزامی است.'],
+            index: true,
+        },
+        // ---------- کاربران منشن‌شده در پاسخ (اختیاری) ----------
+        mentions: [
+            {
+                type: Schema.Types.ObjectId,
+                ref: 'User',
+            },
+        ],
+    },
+    // گزینه‌های طرحواره
+    {
+        // جایگزینی فیلد date با timestamps خودکار
+        timestamps: {
+            createdAt: 'createdAt',
+            updatedAt: 'updatedAt',
+        },
+        versionKey: false,
+        toJSON: { virtuals: true },
+        toObject: { virtuals: true },
     }
-    next();
-  } catch (err) {
-    return next(err);
-  }
-});
+);
 
-CommentReplySchema.pre('deleteOne', async function (next) {
-  const commentReplyId = this.getQuery()['_id'];
-  try {
-    await mongoose
-      .model('CommentReplyVote')
-      .deleteOne({ comment: commentReplyId });
-    next();
-  } catch (err) {
-    return next(err);
-  }
-});
+// ============================================================
+// بخش ۴: ایندکس‌های ترکیبی برای عملکرد بهینه
+// ============================================================
+// دریافت پاسخ‌های یک نظر والد به ترتیب قدیمی‌ترین (نمایش تایم‌لاین)
+// قانون ESR: Equality (parentComment) سپس Sort (createdAt)
+CommentReplySchema.index({ parentComment: 1, createdAt: 1 });
 
+// ============================================================
+// بخش ۵: هوک‌های Mongoose (Middlewares)
+// ============================================================
+
+// ---------- هوک ۱: ایجاد خودکار سند رأی برای پاسخ جدید ----------
 CommentReplySchema.pre('save', async function (next) {
-  if (this.isNew) {
-    try {
-      await mongoose.model('CommentReplyVote').create({ comment: this._id });
-      next();
-    } catch (err) {
-      return next(err);
+    if (this.isNew) {
+        try {
+            await mongoose.model('CommentReplyVote').create({ comment: this._id });
+        } catch (err) {
+            return next(err);
+        }
     }
-  }
-  next();
+    next();
 });
 
-const commentReplyModel = mongoose.model('CommentReply', CommentReplySchema);
-module.exports = commentReplyModel;
+// ---------- هوک ۲: پاک‌سازی رأی هنگام حذف یک پاسخ ----------
+// این هوک تضمین می‌کند که با حذف یک پاسخ، سند رأی مرتبط نیز حذف شود.
+// هوک deleteMany حذف شد؛ زیرا حذف انبوه پاسخ‌ها در برنامه به صورت تکی
+// توسط حذف آبشاری نظر والد مدیریت می‌شود و نیازی به این سطح نیست.
+CommentReplySchema.pre('deleteOne', { document: false, query: true }, async function (next) {
+    try {
+        const filter = this.getFilter();
+        const replyId = filter._id;
+
+        if (!replyId) {
+            console.warn('[CommentReply.deleteOne hook] شناسه پاسخ در فیلتر یافت نشد.');
+            return next();
+        }
+
+        await mongoose.model('CommentReplyVote').deleteOne({ comment: replyId });
+        console.log(`[Cascade Cleanup] رأی پاسخ ${replyId} با موفقیت حذف شد.`);
+        next();
+    } catch (err) {
+        next(err);
+    }
+});
+
+// ============================================================
+// بخش ۶: فیلدهای مجازی (Virtuals)
+// ============================================================
+
+/**
+ * @virtual
+ * @description محاسبه تعداد لایک‌های این پاسخ
+ * @returns {Promise<number>} تعداد آرای موجود در سند CommentReplyVote
+ */
+CommentReplySchema.virtual('likeCount', {
+    ref: 'CommentReplyVote',
+    localField: '_id',
+    foreignField: 'comment',
+    count: true,
+});
+
+// ============================================================
+// بخش ۷: تبدیل خروجی JSON
+// ============================================================
+CommentReplySchema.set('toJSON', {
+    transform: function (doc, ret) {
+        ret.id = ret._id;
+        delete ret.__v;
+        return ret;
+    },
+});
+
+// ============================================================
+// بخش ۸: ایجاد و صادرات مدل
+// ============================================================
+const CommentReply = mongoose.model('CommentReply', CommentReplySchema);
+module.exports = CommentReply;
