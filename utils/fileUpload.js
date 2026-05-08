@@ -1,39 +1,34 @@
 // مسیر فایل: /utils/fileUpload.js
-// توضیح: تعریف میدلورهای آپلود برای بخش‌های مختلف (پست، آواتار، استوری، چت، ریلز)
-// با استفاده از Multer و سرویس ذخیره‌سازی یکپارچه.
+// توضیح: تعریف میدلورهای Multer با حافظه موقت و توابع کمکی برای ذخیره‌سازی فایل.
 
 const multer = require('multer');
 const path = require('path');
 const storageService = require('./storage');
 
-// ============================================================
-// بخش ۱: تنظیمات حافظه موقت (Memory Storage)
-// برای پردازش بهتر، فایل‌ها ابتدا در حافظه ذخیره می‌شوند
-// و سپس توسط storageService در مقصد نهایی ذخیره می‌گردند
-// ============================================================
+// حافظه موقت
 const memStorage = multer.memoryStorage();
 
-// ============================================================
-// بخش ۲: فیلترهای مجاز برای نوع‌های مختلف
-// ============================================================
+// فیلتر تصاویر
 const imageFilter = (req, file, cb) => {
   const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
   if (allowed.includes(file.mimetype)) {
     cb(null, true);
   } else {
-    cb(new Error('فقط تصاویر JPEG، PNG، WebP و GIF مجاز هستند.'));
+    cb(new Error('فقط تصاویر JPEG, PNG, WebP و GIF مجاز هستند.'));
   }
 };
 
+// فیلتر ویدیو
 const videoFilter = (req, file, cb) => {
   const allowed = ['video/mp4', 'video/webm', 'video/quicktime'];
   if (allowed.includes(file.mimetype)) {
     cb(null, true);
   } else {
-    cb(new Error('فقط ویدیوهای MP4، WebM و MOV مجاز هستند.'));
+    cb(new Error('فقط ویدیوهای MP4, WebM و MOV مجاز هستند.'));
   }
 };
 
+// فیلتر ترکیبی (تصویر و ویدیو)
 const mediaFilter = (req, file, cb) => {
   const allowed = [
     'image/jpeg', 'image/png', 'image/webp', 'image/gif',
@@ -46,69 +41,52 @@ const mediaFilter = (req, file, cb) => {
   }
 };
 
-const chatMediaFilter = (req, file, cb) => {
-  // در چت همه نوع فایل قابل قبول است
-  cb(null, true);
-};
+// فیلتر همه نوع فایل (چت)
+const anyFilter = (req, file, cb) => cb(null, true);
 
-// ============================================================
-// بخش ۳: ایجاد میدلورهای آماده برای هر بخش
-// ============================================================
-
-// پست (تصویر)
+// میدلورهای آماده
 const uploadPostImage = multer({
   storage: memStorage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // ۱۰ مگابایت
+  limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: imageFilter,
 }).single('image');
 
-// آواتار (تصویر)
 const uploadAvatar = multer({
   storage: memStorage,
-  limits: { fileSize: 2 * 1024 * 1024 }, // ۲ مگابایت
+  limits: { fileSize: 2 * 1024 * 1024 },
   fileFilter: imageFilter,
 }).single('image');
 
-// استوری (تصویر/ویدیو)
 const uploadStoryMedia = multer({
   storage: memStorage,
-  limits: { fileSize: 50 * 1024 * 1024 }, // ۵۰ مگابایت
+  limits: { fileSize: 50 * 1024 * 1024 },
   fileFilter: mediaFilter,
 }).single('media');
 
-// چت (فایل)
 const uploadChatFile = multer({
   storage: memStorage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // ۱۰ مگابایت
-  fileFilter: chatMediaFilter,
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: anyFilter,
 }).single('file');
 
-// ریلز (ویدیو)
 const uploadReelVideo = multer({
   storage: memStorage,
-  limits: { fileSize: 100 * 1024 * 1024 }, // ۱۰۰ مگابایت
+  limits: { fileSize: 100 * 1024 * 1024 },
   fileFilter: videoFilter,
 }).single('video');
 
-// ============================================================
-// بخش ۴: توابع کمکی برای ذخیره‌سازی با سرویس یکپارچه
-// ============================================================
-const saveUploadedFile = async (file, folder, prefix) => {
-  const filename = storageService.StorageService.generateUniqueFilename(
-    file.originalname,
-    prefix
-  );
-  const publicPath = await storageService.saveBuffer(
-    file.buffer,
-    filename,
-    folder
-  );
-  return publicPath;
+/**
+ * ذخیره فایل آپلود شده (از req.file) با سرویس یکپارچه
+ * @param {object} file - شیء req.file
+ * @param {string} folder - پوشه مقصد
+ * @param {string} prefix - پیشوند نام فایل
+ * @returns {Promise<string>} مسیر عمومی فایل
+ */
+const saveUploadedFile = async (file, folder, prefix = 'file') => {
+  const filename = storageService.StorageService.uniqueFilename(file.originalname, prefix);
+  return await storageService.saveBuffer(file.buffer, filename, folder);
 };
 
-// ============================================================
-// بخش ۵: صادرات
-// ============================================================
 module.exports = {
   uploadPostImage,
   uploadAvatar,
