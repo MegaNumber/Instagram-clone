@@ -2,6 +2,9 @@
 // توضیح: مدل Mongoose برای پاسخ‌های نظرات (Comment Replies). این فایل ساختار یک پاسخ
 // به یک نظر را تعریف می‌کند و شامل هوک‌های ایجاد خودکار سند رأی و حذف آبشاری رأی
 // در هنگام حذف پاسخ است. ایندکس‌های بهینه برای نمایش مرتب پاسخ‌ها نیز تعبیه شده است.
+//
+// @version 2.3.5
+// @since 2026
 
 // ============================================================
 // بخش ۱: ایمپورت ماژول‌های مورد نیاز
@@ -86,8 +89,6 @@ CommentReplySchema.pre('save', async function (next) {
 
 // ---------- هوک ۲: پاک‌سازی رأی هنگام حذف یک پاسخ ----------
 // این هوک تضمین می‌کند که با حذف یک پاسخ، سند رأی مرتبط نیز حذف شود.
-// هوک deleteMany حذف شد؛ زیرا حذف انبوه پاسخ‌ها در برنامه به صورت تکی
-// توسط حذف آبشاری نظر والد مدیریت می‌شود و نیازی به این سطح نیست.
 CommentReplySchema.pre('deleteOne', { document: false, query: true }, async function (next) {
     try {
         const filter = this.getFilter();
@@ -123,7 +124,33 @@ CommentReplySchema.virtual('likeCount', {
 });
 
 // ============================================================
-// بخش ۷: تبدیل خروجی JSON
+// بخش ۷: متدهای استاتیک (کمکی)
+// ============================================================
+
+/**
+ * دریافت صفحه‌بندی‌شده پاسخ‌های یک نظر والد
+ * @param {string} parentCommentId - شناسه نظر والد
+ * @param {object} options - { page, limit }
+ * @returns {Promise<{replies: Array, total: number}>}
+ */
+CommentReplySchema.statics.findByParentCommentPaginated = async function (
+    parentCommentId,
+    { page = 1, limit = 10 } = {}
+) {
+    const skip = (page - 1) * limit;
+    const [replies, total] = await Promise.all([
+        this.find({ parentComment: parentCommentId })
+            .sort({ createdAt: 1 })
+            .skip(skip)
+            .limit(limit)
+            .lean(),
+        this.countDocuments({ parentComment: parentCommentId }),
+    ]);
+    return { replies, total };
+};
+
+// ============================================================
+// بخش ۸: تبدیل خروجی JSON
 // ============================================================
 CommentReplySchema.set('toJSON', {
     transform: function (doc, ret) {
@@ -134,7 +161,7 @@ CommentReplySchema.set('toJSON', {
 });
 
 // ============================================================
-// بخش ۸: ایجاد و صادرات مدل
+// بخش ۹: ایجاد و صادرات مدل
 // ============================================================
 const CommentReply = mongoose.model('CommentReply', CommentReplySchema);
 module.exports = CommentReply;
