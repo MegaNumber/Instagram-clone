@@ -1,7 +1,12 @@
 // مسیر فایل: /models/CommentVote.js
 // توضیح: مدل Mongoose برای آرای نظرات. هر نظر یک سند رأی دارد که آرایه‌ای از
 // رأی‌های کاربران را ذخیره می‌کند. یکتایی رأی‌ها (هر کاربر یک رأی) با اعتبارسنجی
-// و ایندکس تضمین شده است.
+// Schema و منطق برنامه تضمین شده است. این مدل از یک زیرطرحواره برای ثبت زمان
+// دقیق هر رأی استفاده می‌کند و با متدهای استاتیک کمکی، افزودن/حذف رأی را
+// بسیار ساده می‌کند.
+//
+// @version 2.3.4
+// @since 2026
 
 // ============================================================
 // بخش ۱: ایمپورت ماژول‌های مورد نیاز
@@ -87,7 +92,36 @@ CommentVoteSchema.virtual('voteCount').get(function () {
 });
 
 // ============================================================
-// بخش ۶: تبدیل خروجی JSON
+// بخش ۶: متدهای استاتیک (کمکی)
+// ============================================================
+
+/**
+ * افزودن یا حذف رأی کاربر با یک فراخوانی (Toggle).
+ * اگر رأی وجود داشت، حذف می‌کند؛ در غیر این صورت اضافه می‌کند.
+ * @param {string} commentId - شناسه نظر
+ * @param {string} userId - شناسه کاربر
+ * @returns {Promise<string>} - 'added' یا 'removed'
+ */
+CommentVoteSchema.statics.toggleVote = async function (commentId, userId) {
+    const result = await this.updateOne(
+        { comment: commentId, 'votes.author': { $ne: userId } },
+        { $push: { votes: { author: userId } } }
+    );
+
+    if (result.modifiedCount === 1) {
+        return 'added';
+    }
+
+    // رأی قبلاً وجود داشته، پس حذفش می‌کنیم
+    await this.updateOne(
+        { comment: commentId },
+        { $pull: { votes: { author: userId } } }
+    );
+    return 'removed';
+};
+
+// ============================================================
+// بخش ۷: تبدیل خروجی JSON
 // ============================================================
 CommentVoteSchema.set('toJSON', {
     transform: function (doc, ret) {
@@ -99,7 +133,7 @@ CommentVoteSchema.set('toJSON', {
 });
 
 // ============================================================
-// بخش ۷: ایجاد و صادرات مدل
+// بخش ۸: ایجاد و صادرات مدل
 // ============================================================
 const CommentVote = mongoose.model('CommentVote', CommentVoteSchema);
 module.exports = CommentVote;
