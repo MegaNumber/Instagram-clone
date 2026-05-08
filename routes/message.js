@@ -1,45 +1,15 @@
 // مسیر فایل: /routes/message.js
-// توضیح: تعریف مسیرهای پیام‌رسانی مستقیم.
-
-const express = require('express');
-const messageRouter = express.Router();
-const multer = require('multer');
-const path = require('path');
+const router = require('express').Router();
 const { requireAuth } = require('../controllers/authController');
 const asyncHandler = require('../utils/asyncHandler');
-const {
-  getConversations,
-  createOrGetConversation,
-  getMessages,
-  sendTextMessage,
-  sendMediaMessage,
-  deleteConversation,
-} = require('../controllers/messageController');
+const { uploadChatFile } = require('../utils/fileUpload');
+const ctrl = require('../controllers/messageController');
 
-// ============================================================
-// تنظیمات Multer برای آپلود فایل در چت
-// ============================================================
-const chatStorage = multer.diskStorage({
-  destination: 'public/uploads/chat/',
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    cb(null, 'chat-' + uniqueSuffix + path.extname(file.originalname));
-  },
-});
+router.get('/conversations', requireAuth, asyncHandler(ctrl.getConversations));
+router.post('/conversations', requireAuth, asyncHandler(ctrl.createOrGetConversation));
+router.get('/conversations/:conversationId', requireAuth, asyncHandler(ctrl.getMessages));
+router.post('/send-text', requireAuth, asyncHandler(ctrl.sendTextMessage));
+router.post('/send-media', requireAuth, uploadChatFile, asyncHandler(ctrl.sendMediaMessage));
+router.delete('/conversations/:conversationId', requireAuth, asyncHandler(ctrl.deleteConversation));
 
-const chatUpload = multer({
-  storage: chatStorage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // ۱۰ مگابایت
-}).single('file');
-
-// ============================================================
-// مسیرها
-// ============================================================
-messageRouter.get('/conversations', requireAuth, asyncHandler(getConversations));
-messageRouter.post('/conversations', requireAuth, asyncHandler(createOrGetConversation));
-messageRouter.get('/conversations/:conversationId', requireAuth, asyncHandler(getMessages));
-messageRouter.post('/send-text', requireAuth, asyncHandler(sendTextMessage));
-messageRouter.post('/send-media', requireAuth, chatUpload, asyncHandler(sendMediaMessage));
-messageRouter.delete('/conversations/:conversationId', requireAuth, asyncHandler(deleteConversation));
-
-module.exports = messageRouter;
+module.exports = router;
