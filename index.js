@@ -12,12 +12,13 @@
 // - محافظت در برابر HPP و XSS
 // - تجزیهٔ کوکی‌ها
 // - فشرده‌سازی در محیط Production
-// - پشتیبانی از چندین مسیر API شامل Stories، Messages، Reels، Feed هوشمند و Reports
+// - پشتیبانی از چندین مسیر API شامل Stories, Messages, Reels, Feed هوشمند و Reports
 // - مدیریت خطای ساختاریافته با پیام‌های فارسی
 // - ارتباط بلادرنگ با Socket.io و احراز هویت از طریق handshake token
+// - Graceful shutdown برای پایان ایمن پردازش‌ها
 //
 // @author Sandermoen & Contributors
-// @version 2.1.0
+// @version 2.1.1
 // @since 2026
 
 // ============================================================
@@ -233,6 +234,34 @@ io.on('connection', (socket) => {
 // ============================================================
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT} in ${process.env.NODE_ENV || 'development'} mode`);
+});
+
+// ============================================================
+// بخش ۱۹: مدیریت graceful shutdown (خاموشی آرام)
+// ============================================================
+const gracefulShutdown = async (signal) => {
+  console.log(`\n${signal} دریافت شد. خاموشی آرام آغاز می‌شود...`);
+  // بستن اتصال Mongoose
+  await mongoose.connection.close(false);
+  console.log('اتصال MongoDB بسته شد.');
+  // بستن socket.io
+  io.close();
+  // خروج از پروسه
+  process.exit(0);
+};
+
+// گوش دادن به سیگنال‌های سیستم
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// ============================================================
+// بخش ۲۰: مدیریت rejectionهای سراسری (Unhandled Rejection)
+// ============================================================
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+  // در محیط Production ممکن است نخواهیم که پروسه کرش کند،
+  // اما حداقل باید لاگ شود. در اینجا به‌دلیل اهمیت، برنامه را متوقف می‌کنیم.
+  process.exit(1);
 });
 
 module.exports = app; // برای تست‌های احتمالی
