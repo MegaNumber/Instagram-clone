@@ -2,6 +2,9 @@
 // توضیح: تعریف مسیرهای مربوط به احراز هویت. این فایل تمام endpointهای ورود، ثبت‌نام،
 // تغییر رمز عبور و احراز هویت گیت‌هاب را به کنترلرهای مربوطه نگاشت می‌کند.
 // میان‌افزارهای امنیتی مانند Rate Limiting و اعتبارسنجی ورودی‌ها در این سطح اعمال می‌شوند.
+//
+// @version 2.2.0
+// @since 2026
 
 // ============================================================
 // بخش ۱: ایمپورت وابستگی‌های اصلی
@@ -39,7 +42,7 @@ const USERNAME_MIN_LENGTH = 3;
 // محدودسازی برای ورود: هر IP در ۱۵ دقیقه حداکثر ۵ تلاش
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // ۱۵ دقیقه
-  max: 5, // حداکثر ۵ درخواست
+  max: 5,
   standardHeaders: true,
   legacyHeaders: false,
   message: {
@@ -60,7 +63,7 @@ const registerLimiter = rateLimit({
   },
 });
 
-// محدودسازی برای تغییر رمز عبور
+// محدودسازی برای تغییر رمز عبور: هر IP در یک ساعت حداکثر ۲ بار
 const passwordChangeLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // ۱ ساعت
   max: 2,
@@ -70,6 +73,14 @@ const passwordChangeLimiter = rateLimit({
     success: false,
     error: 'تغییر رمز عبور بیش از حد مجاز است. لطفاً یک ساعت صبر کنید.',
   },
+});
+
+// محدودسازی برای ورود با گیت‌هاب (اختیاری)
+const githubLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
 // ============================================================
@@ -102,13 +113,12 @@ const registerValidation = [
 
 /**
  * @constant loginValidation
- * @description زنجیره اعتبارسنجی برای ورود: بررسی ایمیل و رمز عبور
+ * @description زنجیره اعتبارسنجی برای ورود (پشتیبانی از usernameOrEmail)
  */
 const loginValidation = [
-  body('email')
-    .isEmail()
-    .withMessage('لطفاً یک ایمیل معتبر وارد کنید.')
-    .normalizeEmail(),
+  body('usernameOrEmail')
+    .notEmpty()
+    .withMessage('لطفاً نام کاربری یا ایمیل را وارد کنید.'),
   body('password')
     .notEmpty()
     .withMessage('رمز عبور الزامی است.'),
@@ -119,12 +129,25 @@ const loginValidation = [
  * @description زنجیره اعتبارسنجی برای تغییر رمز عبور
  */
 const passwordChangeValidation = [
-  body('currentPassword')
+  body('oldPassword')
     .notEmpty()
     .withMessage('رمز عبور فعلی الزامی است.'),
   body('newPassword')
     .isLength({ min: PASSWORD_MIN_LENGTH })
     .withMessage(`رمز عبور جدید باید حداقل ${PASSWORD_MIN_LENGTH} کاراکتر باشد.`),
+];
+
+/**
+ * @constant githubLoginValidation
+ * @description اعتبارسنجی ورودی برای احراز هویت گیت‌هاب
+ */
+const githubLoginValidation = [
+  body('code')
+    .notEmpty()
+    .withMessage('کد موقت گیت‌هاب الزامی است.'),
+  body('state')
+    .notEmpty()
+    .withMessage('پارامتر state الزامی است.'),
 ];
 
 // ============================================================
@@ -135,15 +158,17 @@ const passwordChangeValidation = [
 // POST /api/auth/login/github
 authRouter.post(
   '/login/github',
-  githubLoginAuthentication
+  githubLoginLimiter,
+  githubLoginValidation,
+  asyncHandler(githubLoginAuthentication)
 );
 
 // ---------- ورود معمولی ----------
 // POST /api/auth/login
 authRouter.post(
   '/login',
-  loginLimiter, // اعمال Rate Limiting برای جلوگیری از حملات Brute Force
-  loginValidation, // اعتبارسنجی ورودی‌های ورود
+  loginLimiter,
+  loginValidation,
   asyncHandler(loginAuthentication)
 );
 
@@ -151,8 +176,8 @@ authRouter.post(
 // POST /api/auth/register
 authRouter.post(
   '/register',
-  registerLimiter, // اعمال Rate Limiting برای جلوگیری از ثبت‌نام جعلی
-  registerValidation, // اعتبارسنجی ورودی‌های ثبت‌نام
+  registerLimiter,
+  registerValidation,
   asyncHandler(register)
 );
 
@@ -160,9 +185,9 @@ authRouter.post(
 // PUT /api/auth/password
 authRouter.put(
   '/password',
-  requireAuth, // فقط کاربران واردشده مجازند
-  passwordChangeLimiter, // محدودسازی تعداد درخواست‌های تغییر رمز
-  passwordChangeValidation, // اعتبارسنجی رمز عبور جدید
+  requireAuth,
+  passwordChangeLimiter,
+  passwordChangeValidation,
   asyncHandler(changePassword)
 );
 
