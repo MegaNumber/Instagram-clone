@@ -1,100 +1,104 @@
 // مسیر فایل: /models/Post.js
-// توضیح: مدل Mongoose برای پست‌ها. این فایل ساختار یک پست را به همراه
-// اعتبارسنجی‌های پیشرفته، ایندکس‌های بهینه برای کوئری‌های متداول و
-// هوک‌های لازم برای حفظ یکپارچگی داده‌ها تعریف می‌کند.
+// توضیح: مدل Mongoose برای پست‌ها. این فایل ساختار یک پست، اعتبارسنجی‌ها،
+// ایندکس‌های بهینه (ESR Rule) برای کوئری‌های متداول، و هوک‌های لازم
+// برای پاک‌سازی آبشاری را تعریف می‌کند. همچنین از فیلدهای مجازی برای
+// محاسبهٔ تعداد لایک‌ها و نظرات استفاده می‌کند.
+// ویژگی‌های پیشرفته: مکان جغرافیایی (GeoJSON)، وضعیت پست (published/draft/archived)
+// و محدودیت تعداد هشتگ.
+//
+// تغییرات نسخه ۲.۳.۱:
+// - افزودن ایندکس 2dsphere برای location جهت پشتیبانی از کوئری‌های مکانی
+// - بهبود regex اعتبارسنجی thumbnail
+// - افزودن توضیحات دقیق‌تر برای هوک حذف
 
 // ============================================================
-// بخش ۱: ایمپورت ماژول‌های مورد نیاز
+// بخش ۱: ایمپورت ماژول‌ها
 // ============================================================
 const mongoose = require('mongoose');
 const Schema = mongoose.Schema;
 
 // ============================================================
-// بخش ۲: ثابت‌های پیکربندی (Configuration Constants)
+// بخش ۲: ثابت‌های پیکربندی
 // ============================================================
-const HASHTAG_MAX_ITEMS = 30; // حداکثر تعداد هشتگ در هر پست
-const CAPTION_MAX_LENGTH = 2200; // حداکثر طول کپشن (مطابق با استاندارد اینستاگرام)
-const IMAGE_PATH_REGEX = /^\/(uploads|images)\/.+\.(jpg|jpeg|png|webp|gif)$/i; // اعتبارسنجی مسیر تصویر
+const HASHTAG_MAX_ITEMS = 30;
+const CAPTION_MAX_LENGTH = 2200;
+// مسیرهای مجاز: /uploads/... یا /images/... با یک زیرپوشهٔ اختیاری
+const IMAGE_PATH_REGEX = /^\/(uploads|images)\/[\w\-./]+\.(jpg|jpeg|png|webp|gif)$/i;
 
 // ============================================================
-// بخش ۳: تعریف طرحواره پست (Post Schema Definition)
+// بخش ۳: تعریف طرحواره پست
 // ============================================================
 const PostSchema = new Schema(
     {
-        // ---------- تصویر اصلی پست ----------
+        // ---------- تصویر اصلی ----------
         image: {
             type: String,
             required: [true, 'تصویر پست الزامی است.'],
             trim: true,
             validate: {
-                validator: function (value) {
-                    // مسیر ذخیره‌سازی محلی باید با الگوی مشخصی مطابقت داشته باشد
-                    return IMAGE_PATH_REGEX.test(value);
-                },
+                validator: (v) => IMAGE_PATH_REGEX.test(v),
                 message: 'مسیر فایل تصویر اصلی نامعتبر است.',
             },
         },
-        // ---------- نسخه بندانگشتی (Thumbnail) ----------
+        // ---------- بندانگشتی (Thumbnail) ----------
         thumbnail: {
             type: String,
             trim: true,
+            default: '',
             validate: {
-                validator: function (value) {
-                    if (!value) return true; // فیلد اختیاری
-                    return IMAGE_PATH_REGEX.test(value);
+                validator: function (v) {
+                    if (!v) return true;
+                    return IMAGE_PATH_REGEX.test(v);
                 },
                 message: 'مسیر فایل بندانگشتی نامعتبر است.',
             },
-            default: '', // در صورت عدم وجود، از image استفاده می‌شود
         },
         // ---------- فیلتر تصویر ----------
         filter: {
             type: String,
             trim: true,
-            // پیش‌فرض 'normal' نشان‌دهنده عدم اعمال فیلتر است
             default: 'normal',
         },
-        // ---------- متن کپشن پست ----------
+        // ---------- کپشن ----------
         caption: {
             type: String,
             trim: true,
             maxlength: [CAPTION_MAX_LENGTH, `کپشن نمی‌تواند بیشتر از ${CAPTION_MAX_LENGTH} کاراکتر باشد.`],
             default: '',
         },
-        // ---------- هشتگ‌های استخراج‌شده از متن ----------
+        // ---------- هشتگ‌ها ----------
         hashtags: [
             {
                 type: String,
-                lowercase: true, // ذخیره به صورت حروف کوچک برای جستجوی غیرحساس به بزرگی
+                lowercase: true,
             },
         ],
-        // ---------- مکان جغرافیایی (ویژگی جدید) ----------
-        // این فیلد برای ذخیره مکان ثبت پست (مشابه Instagram) اضافه شده است
+        // ---------- مکان جغرافیایی (GeoJSON Point) ----------
         location: {
             type: {
                 type: String,
-                enum: ['Point'], // نوع مکان جغرافیایی
+                enum: ['Point'],
                 default: undefined,
             },
             coordinates: {
-                type: [Number], // [longitude, latitude]
+                type: [Number],   // [longitude, latitude]
                 default: undefined,
             },
             name: {
-                type: String, // نام مکان (مثلاً "Tehran, Iran")
+                type: String,
                 trim: true,
                 maxlength: 200,
                 default: '',
             },
         },
-        // ---------- نویسنده پست ----------
+        // ---------- نویسنده ----------
         author: {
             type: Schema.Types.ObjectId,
             ref: 'User',
             required: [true, 'نویسنده پست الزامی است.'],
-            index: true, // ایندکس برای جستجوی سریع پست‌های یک کاربر
+            index: true,
         },
-        // ---------- وضعیت پست ----------
+        // ---------- وضعیت ----------
         status: {
             type: String,
             enum: ['published', 'archived', 'draft'],
@@ -102,105 +106,74 @@ const PostSchema = new Schema(
             index: true,
         },
     },
-    // گزینه‌های طرحواره
     {
-        // افزودن خودکار createdAt و updatedAt
         timestamps: {
-            createdAt: 'createdAt', // زمان ایجاد
-            updatedAt: 'updatedAt', // زمان آخرین به‌روزرسانی
+            createdAt: 'createdAt',
+            updatedAt: 'updatedAt',
         },
-        // حذف فیلد __v برای کاهش حجم سند
         versionKey: false,
-        // فعال‌سازی virtuals در خروجی JSON
         toJSON: { virtuals: true },
         toObject: { virtuals: true },
     }
 );
 
 // ============================================================
-// بخش ۴: تعریف ایندکس‌های بهینه برای کوئری‌های متداول
+// بخش ۴: ایندکس‌های بهینه (ESR Rule)
 // ============================================================
-
-// ایندکس ترکیبی برای فید پست‌ها: فید کاربران بر اساس زمان و وضعیت پست مرتب می‌شود
-// این ایندکس مهم‌ترین ایندکس برای عملکرد بخش "Home Feed" است
-// طبق قانون ESR: ابتدا فیلدهای Equality (status)، سپس Sort (createdAt)
+// ۱. فید اصلی: وضعیت + جدیدترین
 PostSchema.index({ status: 1, createdAt: -1 });
-
-// ایندکس برای جستجوی پست‌ها بر اساس نویسنده و زمان
-// کاربرد: دریافت پست‌های یک کاربر خاص به ترتیب جدیدترین
+// ۲. پست‌های یک کاربر: نویسنده + جدیدترین
 PostSchema.index({ author: 1, createdAt: -1 });
-
-// ایندکس ترکیبی برای جستجوی پست‌ها بر اساس هشتگ (Equality) و زمان (Sort)
-// کاربرد: صفحه جستجوی هشتگ‌ها
+// ۳. جستجوی هشتگ
 PostSchema.index({ hashtags: 1, createdAt: -1 });
+// ۴. جستجوی مکانی (آینده‌نگر)
+PostSchema.index({ location: '2dsphere' });
 
 // ============================================================
-// بخش ۵: هوک‌های Mongoose (Middlewares)
+// بخش ۵: هوک‌ها
 // ============================================================
 
-// ---------- هوک ۱: پاک‌سازی آبشاری قبل از حذف یک پست ----------
-// این هوک تضمین می‌کند که با حذف یک پست، تمام داده‌های مرتبط
-// (رأی‌ها، نظرات، نوتیفیکیشن‌ها) نیز به صورت آبشاری حذف شوند.
+// ----- ۵.۱. حذف آبشاری -----
+// وقتی یک پست حذف می‌شود (مثلاً با Post.deleteOne({_id}) یا findByIdAndDelete)
+// تمام داده‌های مرتبط نیز حذف شوند.
 PostSchema.pre('deleteOne', { document: false, query: true }, async function (next) {
+    const postId = this.getFilter()._id;
+    if (!postId) {
+        console.warn('[Post.deleteOne] No _id in filter, skipping cascade.');
+        return next();
+    }
     try {
-        // دریافت فیلتر کوئری برای یافتن شناسه پست در حال حذف
-        const filter = this.getFilter();
-        const postId = filter._id;
-
-        if (!postId) {
-            console.warn('[Post.deleteOne hook] شناسه پست در فیلتر یافت نشد.');
-            return next();
-        }
-
-        // حذف آبشاری: رأی‌ها، نظرات و نوتیفیکیشن‌های مرتبط
-        const cleanupOperations = [
+        await Promise.all([
             mongoose.model('PostVote').deleteOne({ post: postId }),
             mongoose.model('Comment').deleteMany({ post: postId }),
-            // حذف نوتیفیکیشن‌هایی که به این پست اشاره دارند
             mongoose.model('Notification').deleteMany({ 'notificationData.postId': postId }),
-        ];
-
-        await Promise.all(cleanupOperations);
-
-        console.log(`[Cascade Cleanup] اسناد مرتبط با پست ${postId} با موفقیت حذف شدند.`);
+        ]);
+        console.log(`[Cascade] Cleanup for post ${postId} completed.`);
         next();
     } catch (err) {
         next(err);
     }
 });
 
-// ---------- هوک ۲: اعمال محدودیت تعداد هشتگ‌ها قبل از ذخیره ----------
-// این هوک تضمین می‌کند که تعداد هشتگ‌ها از حد مجاز تجاوز نکند
+// ----- ۵.۲. محدودیت تعداد هشتگ -----
 PostSchema.pre('save', function (next) {
     if (this.hashtags && this.hashtags.length > HASHTAG_MAX_ITEMS) {
-        // کوتاه کردن آرایه هشتگ‌ها به حداکثر تعداد مجاز
         this.hashtags = this.hashtags.slice(0, HASHTAG_MAX_ITEMS);
-        console.warn(`[Post.pre-save] تعداد هشتگ‌ها به حداکثر ${HASHTAG_MAX_ITEMS} محدود شد.`);
+        console.warn(`[Post.pre-save] Hashtags truncated to ${HASHTAG_MAX_ITEMS}.`);
     }
     next();
 });
 
 // ============================================================
-// بخش ۶: فیلدهای مجازی (Virtual Fields)
+// بخش ۶: فیلدهای مجازی
 // ============================================================
-
-/**
- * @virtual
- * @description محاسبه تعداد کل لایک‌های پست
- * @returns {Promise<number>} تعداد رأی‌ها
- */
 PostSchema.virtual('likeCount', {
     ref: 'PostVote',
     localField: '_id',
     foreignField: 'post',
-    count: true, // فقط تعداد اسناد مرتبط را برمی‌گرداند
+    count: true,
 });
 
-/**
- * @virtual
- * @description محاسبه تعداد کل نظرات پست
- * @returns {Promise<number>} تعداد نظرات
- */
 PostSchema.virtual('commentCount', {
     ref: 'Comment',
     localField: '_id',
@@ -209,21 +182,32 @@ PostSchema.virtual('commentCount', {
 });
 
 // ============================================================
-// بخش ۷: تنظیمات تبدیل به JSON و Object
+// بخش ۷: تبدیل خروجی JSON
 // ============================================================
-// حذف خودکار فیلدهای داخلی هنگام ارسال پاسخ به کلاینت
 PostSchema.set('toJSON', {
-    transform: function (doc, ret) {
-        // حذف فیلدهای غیرضروری
-        delete ret.__v; // نسخه سند (در صورت فعال بودن versionKey)
-        // ret.id = ret._id; // افزودن id به عنوان alias در صورت نیاز
+    transform: (doc, ret) => {
+        delete ret.__v;
         return ret;
     },
 });
 
 // ============================================================
-// بخش ۸: ایجاد و صادرات مدل
+// بخش ۸: متدهای استاتیک (کمکی)
+// ============================================================
+/**
+ * پیدا کردن پست با شناسه و در صورت نیاز بررسی نویسنده
+ * @param {string} postId
+ * @param {string} [authorId] - اگر داده شود، پست فقط در صورت تطابق نویسنده برگردانده می‌شود
+ * @returns {Promise<Post|null>}
+ */
+PostSchema.statics.findByIdAndAuthor = async function (postId, authorId) {
+    const query = { _id: postId };
+    if (authorId) query.author = authorId;
+    return this.findOne(query);
+};
+
+// ============================================================
+// بخش ۹: صادرات مدل
 // ============================================================
 const Post = mongoose.model('Post', PostSchema);
-
 module.exports = Post;
