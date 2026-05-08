@@ -1,7 +1,10 @@
 // مسیر فایل: /models/PostVote.js
 // توضیح: مدل Mongoose برای آرای پست‌ها. هر پست دارای یک سند رأی است
 // که آرایه‌ای از رأی‌های کاربران را در خود ذخیره می‌کند. یکتایی رأی‌ها
-// (هر کاربر فقط یک رأی) هم در برنامه و هم با اعتبارسنجی Schema تضمین می‌شود.
+// (هر کاربر فقط یک رأی) هم در منطق برنامه و هم با اعتبارسنجی Schema تضمین می‌شود.
+//
+// @version 2.3.2
+// @since 2026
 
 // ============================================================
 // بخش ۱: ایمپورت ماژول‌های مورد نیاز
@@ -88,7 +91,36 @@ PostVoteSchema.virtual('voteCount').get(function () {
 });
 
 // ============================================================
-// بخش ۶: تبدیل خروجی JSON
+// بخش ۶: متدهای استاتیک (کمکی)
+// ============================================================
+
+/**
+ * افزودن یا حذف رأی کاربر با یک فراخوانی.
+ * اگر رأی وجود داشت، حذف می‌کند؛ در غیر این صورت اضافه می‌کند.
+ * @param {string} postId - شناسه پست
+ * @param {string} userId - شناسه کاربر
+ * @returns {Promise<string>} - 'added' یا 'removed'
+ */
+PostVoteSchema.statics.toggleVote = async function (postId, userId) {
+    const result = await this.updateOne(
+        { post: postId, 'votes.author': { $ne: userId } },
+        { $push: { votes: { author: userId } } }
+    );
+
+    if (result.modifiedCount === 1) {
+        return 'added';
+    }
+
+    // رأی قبلاً وجود داشت، پس حذفش می‌کنیم
+    await this.updateOne(
+        { post: postId },
+        { $pull: { votes: { author: userId } } }
+    );
+    return 'removed';
+};
+
+// ============================================================
+// بخش ۷: تبدیل خروجی JSON
 // ============================================================
 PostVoteSchema.set('toJSON', {
     transform: function (doc, ret) {
@@ -101,7 +133,7 @@ PostVoteSchema.set('toJSON', {
 });
 
 // ============================================================
-// بخش ۷: ایجاد و صادرات مدل
+// بخش ۸: ایجاد و صادرات مدل
 // ============================================================
 const PostVote = mongoose.model('PostVote', PostVoteSchema);
 module.exports = PostVote;
