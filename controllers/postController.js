@@ -1,653 +1,653 @@
-// ==========================================
-// بخش اول: وارد کردن کتابخانه‌ها و ماژول‌های مورد نیاز
-// ==========================================
+// مسیر فایل: /controllers/postController.js
+// توضیح: کنترلر مدیریت پست‌ها. این فایل منطق اصلی ایجاد، حذف، بازیابی، رأی‌دهی و
+// نمایش فید پست‌ها را مدیریت می‌کند. همچنین شامل توابع بازیابی پست‌های پیشنهادی و
+// جستجو بر اساس هشتگ است. از الگوی asyncHandler برای حذف try-catch تکراری
+// و از sharp برای تولید خودکار بندانگشتی (thumbnail) استفاده می‌کند.
 
-// حذف شده: const cloudinary = require('cloudinary').v2;
-// دیگر نیازی به کلودینری نداریم، عکس‌ها را روی سرور خودمان ذخیره می‌کنیم
-
-const linkify = require('linkifyjs');
-// حذف شده: const axios = require('axios');
-// دیگر نیازی به بررسی محتوای نامناسب با سرویس خارجی نداریم
-
-// افزونه هشتگ‌یاب را به لینکیفای اضافه می‌کنیم
-// این به ما کمک می‌کند هشتگ‌های داخل متن کپشن را پیدا کنیم
+// ============================================================
+// بخش ۱: ایمپورت کتابخانه‌ها و ماژول‌های مورد نیاز
+// ============================================================
+const sharp = require('sharp');               // پردازش تصویر: تولید بندانگشتی
+const path = require('path');                 // مدیریت مسیرهای فایل
+const fs = require('fs').promises;            // عملیات فایل async
+const linkify = require('linkifyjs');         // استخراج هشتگ و منشن از متن
 require('linkifyjs/plugins/hashtag')(linkify);
+const mongoose = require('mongoose');
+const ObjectId = mongoose.Types.ObjectId;
 
 const Post = require('../models/Post');
 const PostVote = require('../models/PostVote');
-const Following = require('../models/Following');
 const Followers = require('../models/Followers');
+const Following = require('../models/Following');
 const Notification = require('../models/Notification');
 const socketHandler = require('../handlers/socketHandler');
-const fs = require('fs');
-const ObjectId = require('mongoose').Types.ObjectId;
-
-const {
-  retrieveComments,
-  // حذف شده: formatCloudinaryUrl,
-  // دیگر نیازی به تغییر اندازه عکس با کلودینری نداریم
-  populatePostsPipeline,
-} = require('../utils/controllerUtils');
+const asyncHandler = require('../utils/asyncHandler');
+const { retrieveComments, populatePostsPipeline } = require('../utils/controllerUtils');
 const filters = require('../utils/filters');
 
-// ==========================================
-// تابع کمکی: ساختن نسخه بندانگشتی (Thumbnail) از مسیر محلی عکس
-// ==========================================
-// قبلاً کلودینری این کار را با فرمت کردن آدرس انجام می‌داد.
-// حالا ما یک تابع ساده می‌نویسیم که همان مسیر اصلی را برمی‌گرداند.
-// اگر در آینده خواستی عکس‌های کوچک‌تر بسازی، می‌توانی از کتابخانه‌ای مثل sharp استفاده کنی
-function formatLocalThumbnailUrl(imagePath) {
-  // فعلاً همان مسیر اصلی را به عنوان بندانگشتی برمی‌گردانیم
-  // در نسخه‌های بعدی می‌توان اینجا عکس را کوچک کرد
-  return imagePath;
-}
+// ============================================================
+// بخش ۲: ثابت‌های پیکربندی
+// ============================================================
+const FEED_PAGE_SIZE = 5;                     // تعداد پست در هر صفحه فید
+const SUGGESTED_PAGE_SIZE = 20;               // تعداد پست‌های پیشنهادی
+const HASHTAG_PAGE_SIZE = 20;                 // تعداد پست‌های هشتگ
+const MAX_IMAGE_SIZE_MB = 10;                 // حداکثر حجم عکس (مگابایت)
+const THUMBNAIL_WIDTH = 400;                  // عرض بندانگشتی
+const THUMBNAIL_HEIGHT = 400;                 // ارتفاع بندانگشتی
+const ALLOWED_IMAGE_TYPES = [                 // انواع مجاز تصویر
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/gif',
+];
+const UNWANTED_USER_FIELDS = [                // فیلدهای کاربر که نباید افشا شوند
+  'author.password',
+  'author.private',
+  'author.confirmed',
+  'author.bookmarks',
+  'author.email',
+  'author.website',
+  'author.bio',
+  'author.githubId',
+];
 
-// ==========================================
-// تابع: ساخت پست جدید (Create Post)
-// ==========================================
-module.exports.createPost = async (req, res, next) => {
-  // دریافت کاربر جاری که از میدل‌ور احراز هویت عبور کرده است
-  const user = res.locals.user;
-  
-  // دریافت کپشن (متن پست) و نام فیلتر از بدنه درخواست
-  const { caption, filter: filterName } = req.body;
-  let post = undefined;
-  
-  // پیدا کردن شیء فیلتر از لیست فیلترهای موجود
-  // فیلترها افکت‌های بصری مثل سیاه و سفید یا قهوه‌ای هستند که روی عکس اعمال می‌شوند
-  const filterObject = filters.find((filter) => filter.name === filterName);
-  
-  // استخراج هشتگ‌ها از متن کپشن با استفاده از کتابخانه لینکیفای
+// ============================================================
+// بخش ۳: توابع کمکی (Utility Functions)
+// ============================================================
+
+/**
+ * @function isValidObjectId
+ * @description بررسی اعتبار یک رشته به عنوان ObjectId مونگوس
+ * @param {string} id - رشته مورد بررسی
+ * @returns {boolean} - نتیجه بررسی
+ */
+const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
+
+/**
+ * @function extractHashtags
+ * @description استخراج هشتگ‌ها از متن کپشن با استفاده از linkifyjs
+ * @param {string} caption - متن کپشن پست
+ * @returns {string[]} - آرایه‌ای از هشتگ‌های استخراج‌شده (بدون علامت #)
+ */
+const extractHashtags = (caption) => {
+  if (!caption) return [];
   const hashtags = [];
   linkify.find(caption).forEach((result) => {
-    // اگر نوع نتیجه از نوع هشتگ باشد
     if (result.type === 'hashtag') {
-      // علامت # را از ابتدای هشتگ حذف می‌کنیم و فقط متن خالص را ذخیره می‌کنیم
-      // مثال: #سلام -> سلام
-      hashtags.push(result.value.substring(1));
+      hashtags.push(result.value.substring(1).toLowerCase());
     }
   });
+  // حذف هشتگ‌های تکراری
+  return [...new Set(hashtags)];
+};
 
-  // ==========================================
-  // تغییر اصلی: بررسی وجود فایل و استفاده از مسیر محلی
-  // ==========================================
-  
-  // بررسی می‌کنیم که آیا کاربر اصلاً عکسی آپلود کرده است یا نه
-  // req.file توسط میدل‌ور مالتر (که در فایل مسیرها تنظیم کردیم) ایجاد می‌شود
+/**
+ * @function generateThumbnail
+ * @description تولید نسخه بندانگشتی از تصویر اصلی با استفاده از sharp
+ * @param {string} imagePath - مسیر فایل تصویر اصلی
+ * @returns {Promise<string>} - مسیر فایل بندانگشتی
+ */
+const generateThumbnail = async (imagePath) => {
+  const thumbnailPath = imagePath.replace(/(\.\w+)$/, '_thumb$1');
+  try {
+    await sharp(imagePath)
+      .resize(THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT, { fit: 'cover' })
+      .jpeg({ quality: 80 })
+      .toFile(thumbnailPath);
+    return thumbnailPath;
+  } catch (err) {
+    console.error('[generateThumbnail] خطا در تولید بندانگشتی:', err.message);
+    // در صورت خطا، مسیر اصلی را برمی‌گردانیم
+    return imagePath;
+  }
+};
+
+/**
+ * @function broadcastToFollowers
+ * @description ارسال یک رویداد به تمام دنبال‌کنندگان یک کاربر
+ * @param {object} req - شیء درخواست Express
+ * @param {string} userId - شناسه کاربر
+ * @param {function} callback - تابع ارسال (مثل sendPost یا deletePost)
+ * @param {any} data - داده‌ای که باید ارسال شود
+ */
+const broadcastToFollowers = async (req, userId, callback, data) => {
+  try {
+    const followersDoc = await Followers.findOne({ user: ObjectId(userId) }).lean();
+    if (!followersDoc?.followers?.length) return;
+
+    followersDoc.followers.forEach((follower) => {
+      callback(req, data, follower.user);
+    });
+  } catch (err) {
+    console.error('[broadcastToFollowers] خطا در ارسال به دنبال‌کنندگان:', err.message);
+  }
+};
+
+/**
+ * @function sendLikeNotification
+ * @description ایجاد و ارسال نوتیفیکیشن لایک
+ */
+const sendLikeNotification = async (req, user, post) => {
+  if (String(post.author) === String(user._id)) return;
+
+  try {
+    const notification = await Notification.create({
+      sender: user._id,
+      receiver: post.author,
+      notificationType: 'like',
+      date: new Date(),
+      notificationData: {
+        postId: post._id,
+        image: post.thumbnail || post.image,
+        filter: post.filter,
+      },
+    });
+
+    socketHandler.sendNotification(req, {
+      ...notification.toObject(),
+      sender: {
+        _id: user._id,
+        username: user.username,
+        avatar: user.avatar,
+      },
+    });
+  } catch (err) {
+    console.error('[sendLikeNotification] خطا در ارسال نوتیفیکیشن لایک:', err.message);
+  }
+};
+
+// ============================================================
+// بخش ۴: کنترلر ایجاد پست (Create Post)
+// ============================================================
+
+/**
+ * @function createPost
+ * @description ایجاد پست جدید با تصویر محلی
+ * @route POST /api/posts
+ * @middleware requireAuth, multer.single('image')
+ */
+module.exports.createPost = asyncHandler(async (req, res) => {
+  const user = res.locals.user;
+  const { caption, filter: filterName } = req.body;
+
+  // اعتبارسنجی وجود فایل تصویر
   if (!req.file) {
-    return res
-      .status(400)
-      .send({ error: 'لطفاً یک تصویر برای پست انتخاب کنید.' });
+    return res.status(400).json({
+      success: false,
+      error: 'لطفاً یک تصویر برای پست انتخاب کنید.',
+    });
   }
 
-  // ==========================================
-  // حذف کامل بخش آپلود به کلودینری
-  // ==========================================
-  // قبلاً اینجا تنظیمات کلودینری انجام می‌شد و عکس در فضای ابری آپلود می‌گردید
-  // cloudinary.config({ ... });
-  // const response = await cloudinary.uploader.upload(req.file.path);
-  
-  // حالا مسیر فایل ذخیره‌شده روی سرور خودمان را می‌سازیم
-  // req.file.filename نام فایلی است که مالتر با فرمول یکتای ما ساخته است
-  // مثال نام فایل: post-1700000000000-123456789.jpg
+  // بررسی نوع فایل
+  if (!ALLOWED_IMAGE_TYPES.includes(req.file.mimetype)) {
+    await fs.unlink(req.file.path).catch(() => {});
+    return res.status(400).json({
+      success: false,
+      error: 'فقط فایل‌های تصویری (JPEG، PNG، WebP، GIF) مجاز هستند.',
+    });
+  }
+
+  // یافتن فیلتر
+  const filterObject = filters.find((f) => f.name === filterName);
+  const hashtags = extractHashtags(caption);
+
+  // مسیر ذخیره‌سازی
   const imageUrl = '/uploads/' + req.file.filename;
 
-  // ==========================================
-  // حذف بررسی محتوای نامناسب با ModerateContent
-  // ==========================================
-  // قبلاً اینجا با axios به سرویس ModerateContent درخواست می‌دادیم
-  // و بررسی می‌کردیم که عکس محتوای نامناسب نداشته باشد
-  // برای سادگی یادگیری، این بخش را موقتاً حذف می‌کنیم
-  
-  try {
-    // ==========================================
-    // ساخت بندانگشتی (نسخه کوچک عکس) از مسیر محلی
-    // ==========================================
-    // قبلاً: const thumbnailUrl = formatCloudinaryUrl(response.secure_url, ...);
-    // حالا از تابع ساده خودمان استفاده می‌کنیم
-    const thumbnailUrl = formatLocalThumbnailUrl(imageUrl);
-    
-    // ==========================================
-    // حذف دستور پاک کردن فایل موقت
-    // ==========================================
-    // قبلاً: fs.unlinkSync(req.file.path);
-    // این دستور فایل موقت را بعد از آپلود به کلودینری پاک می‌کرد
-    // حالا چون فایل را برای همیشه روی سرور نگه می‌داریم، نباید پاکش کنیم!
-    // این خط کاملاً حذف شده است
-    
-    // ==========================================
-    // ساخت نمونه جدید از مدل Post (پست)
-    // ==========================================
-    post = new Post({
-      image: imageUrl,              // مسیر عکس اصلی روی سرور خودمان
-      thumbnail: thumbnailUrl,       // مسیر نسخه بندانگشتی (فعلاً همان مسیر اصلی)
-      filter: filterObject ? filterObject.filter : '', // ذخیره نام فیلتر در صورت وجود
-      caption,                       // متن کپشن نوشته شده توسط کاربر
-      author: user._id,             // شناسه کاربری که پست را ساخته است
-      hashtags,                     // آرایه‌ای از هشتگ‌های استخراج شده
-    });
-    
-    // ==========================================
-    // ساخت رکورد رأی (لایک) برای پست جدید
-    // ==========================================
-    // هر پست جدید یک سند PostVote مخصوص به خود دارد
-    // که آرایه‌ای از رأی‌ها (لایک‌ها) را نگه می‌دارد
-    const postVote = new PostVote({
-      post: post._id,               // ارجاع به شناسه پست
-    });
-    
-    // ذخیره هم‌زمان پست و رأی‌های آن در دیتابیس
-    await post.save();
-    await postVote.save();
-    
-    // ارسال پاسخ موفقیت به کاربر
-    // اطلاعات پست جدید را همراه با جزئیات کاربر و آرایه‌های خالی برای نظرات و رأی‌ها برمی‌گردانیم
-    res.status(201).send({
-      ...post.toObject(),           // تبدیل سند مونگوس به یک شیء ساده جاوااسکریپت
-      postVotes: [],                // پست جدید هنوز رأیی ندارد
-      comments: [],                 // پست جدید هنوز نظری ندارد
-      author: { 
-        avatar: user.avatar, 
-        username: user.username 
-      },
-    });
-  } catch (err) {
-    // اگر در فرآیند ذخیره‌سازی خطایی رخ داد، آن را به میدل‌ور مدیریت خطا می‌فرستیم
-    next(err);
-  }
+  // تولید بندانگشتی
+  const thumbnailFullPath = await generateThumbnail(req.file.path);
+  const thumbnailUrl = thumbnailFullPath.replace('public', '');
 
-  // ==========================================
-  // بخش ارسال نوتیفیکیشن به دنبال‌کنندگان (بدون تغییر)
-  // ==========================================
-  try {
-    // پیدا کردن لیست دنبال‌کنندگان کاربر
-    const followersDocument = await Followers.find({ user: user._id });
-    // followersDocument یک آرایه است، اولین عنصر را برمی‌داریم
-    const followers = followersDocument[0].followers;
-    
-    // ساختن یک شیء از پست برای ارسال از طریق سوکت
-    const postObject = {
+  // ایجاد پست و رأی‌ها
+  const [post] = await Promise.all([
+    Post.create({
+      image: imageUrl,
+      thumbnail: thumbnailUrl,
+      filter: filterObject?.filter || '',
+      caption: caption || '',
+      author: user._id,
+      hashtags,
+    }),
+    PostVote.create({ post: undefined }), // ابتدا رأی را با post undefined می‌سازیم
+  ]);
+
+  // به‌روزرسانی شناسه پست در PostVote
+  await PostVote.findOneAndUpdate(
+    { post: undefined },
+    { post: post._id },
+    { sort: { _id: -1 } }
+  );
+
+  // پاسخ موفقیت
+  res.status(201).json({
+    success: true,
+    message: 'پست با موفقیت ایجاد شد.',
+    data: {
       ...post.toObject(),
-      author: { 
-        username: user.username, 
-        avatar: user.avatar 
-      },
-      commentData: { 
-        commentCount: 0, 
-        comments: [] 
-      },
       postVotes: [],
-    };
+      comments: 0,
+      author: {
+        _id: user._id,
+        avatar: user.avatar,
+        username: user.username,
+      },
+    },
+  });
 
-    // ارسال پست جدید به تمام دنبال‌کنندگان از طریق وب‌سوکت
-    // این کار باعث می‌شود پست به صورت زنده در فید دنبال‌کنندگان نمایش داده شود
-    followers.forEach((follower) => {
-      socketHandler.sendPost(
-        req,
-        postObject,                 // اطلاعات کامل پست
-        follower.user               // شناسه کاربر دنبال‌کننده
-      );
-    });
-  } catch (err) {
-    // خطا در ارسال نوتیفیکیشن نباید فرآیند ساخت پست را مختل کند
-    // فقط آن را در کنسول ثبت می‌کنیم
-    console.log('خطا در ارسال نوتیفیکیشن پست جدید:', err);
-  }
-};
+  // ارسال به دنبال‌کنندگان (در پس‌زمینه - بدون await)
+  const postObject = {
+    ...post.toObject(),
+    author: { _id: user._id, username: user.username, avatar: user.avatar },
+    commentData: { commentCount: 0, comments: [] },
+    postVotes: [],
+  };
+  broadcastToFollowers(req, user._id, socketHandler.sendPost, postObject);
+});
 
-// ==========================================
-// تابع: حذف پست (Delete Post)
-// ==========================================
-module.exports.deletePost = async (req, res, next) => {
-  // دریافت شناسه پست از پارامترهای مسیر
+// ============================================================
+// بخش ۵: کنترلر حذف پست (Delete Post)
+// ============================================================
+
+/**
+ * @function deletePost
+ * @description حذف پست و فایل‌های مرتبط
+ * @route DELETE /api/posts/:postId
+ * @middleware requireAuth
+ */
+module.exports.deletePost = asyncHandler(async (req, res) => {
   const { postId } = req.params;
   const user = res.locals.user;
 
-  try {
-    // اول بررسی می‌کنیم که پست وجود دارد و متعلق به همین کاربر است
-    const post = await Post.findOne({ _id: postId, author: user._id });
-    if (!post) {
-      return res.status(404).send({
-        error: 'پستی با این شناسه برای این کاربر پیدا نشد.',
-      });
-    }
-    
-    // ==========================================
-    // نکته مهم: پاک کردن فایل عکس از روی سرور
-    // ==========================================
-    // وقتی پست حذف می‌شود، باید فایل عکس آن را هم از پوشه uploads پاک کنیم
-    // مسیر فایل را از آدرس ذخیره‌شده استخراج می‌کنیم
-    // مثال: /uploads/post-123.jpg -> public/uploads/post-123.jpg
-    try {
-      const filePath = 'public' + post.image; // ساخت مسیر کامل فایل
-      // بررسی می‌کنیم که فایل وجود داشته باشد
-      if (fs.existsSync(filePath)) {
-        // فایل را از روی دیسک پاک می‌کنیم
-        fs.unlinkSync(filePath);
-        console.log(`فایل ${filePath} با موفقیت پاک شد.`);
-      }
-    } catch (fileErr) {
-      // اگر فایل پاک نشد، فقط در کنسول ثبت می‌کنیم و ادامه می‌دهیم
-      console.log('خطا در پاک کردن فایل عکس:', fileErr.message);
-    }
-    
-    // حذف پست از دیتابیس
-    // متد deleteOne با استفاده از هوک‌های پیش‌فرض مونگوس،
-    // تمام موارد مرتبط مثل نظرات را هم پاک می‌کند
-    const postDelete = await Post.deleteOne({
-      _id: postId,
+  // اعتبارسنجی شناسه
+  if (!isValidObjectId(postId)) {
+    return res.status(400).json({
+      success: false,
+      error: 'شناسه پست نامعتبر است.',
     });
-    
-    if (!postDelete.deletedCount) {
-      return res.status(500).send({ error: 'حذف پست با مشکل مواجه شد.' });
-    }
-    
-    // ارسال پاسخ موفقیت (کد 204 یعنی محتوایی برای بازگشت نیست)
-    res.status(204).send();
-  } catch (err) {
-    next(err);
   }
 
-  // ==========================================
-  // اطلاع‌رسانی حذف پست به دنبال‌کنندگان (بدون تغییر)
-  // ==========================================
-  try {
-    const followersDocument = await Followers.find({ user: user._id });
-    const followers = followersDocument[0].followers;
-    
-    // ارسال رویداد حذف به خود کاربر
-    socketHandler.deletePost(req, postId, user._id);
-    
-    // ارسال رویداد حذف به تمام دنبال‌کنندگان
-    followers.forEach((follower) =>
-      socketHandler.deletePost(req, postId, follower.user)
-    );
-  } catch (err) {
-    console.log('خطا در ارسال نوتیفیکیشن حذف پست:', err);
+  // یافتن پست
+  const post = await Post.findOne({ _id: postId, author: user._id });
+  if (!post) {
+    return res.status(404).json({
+      success: false,
+      error: 'پستی با این شناسه برای شما یافت نشد.',
+    });
   }
-};
 
-// ==========================================
-// تابع: دریافت یک پست خاص (Retrieve Post)
-// این تابع بدون تغییر باقی می‌ماند
-// ==========================================
-module.exports.retrievePost = async (req, res, next) => {
+  // حذف فایل‌های تصویر از دیسک
+  const filesToDelete = [post.image, post.thumbnail]
+    .filter(Boolean)
+    .map((img) => path.join('public', img));
+  await Promise.allSettled(
+    filesToDelete.map((filePath) => fs.unlink(filePath))
+  );
+
+  // حذف پست از دیتابیس
+  await Post.deleteOne({ _id: postId });
+
+  res.status(200).json({
+    success: true,
+    message: 'پست با موفقیت حذف شد.',
+  });
+
+  // اطلاع‌رسانی به دنبال‌کنندگان
+  broadcastToFollowers(req, user._id, socketHandler.deletePost, postId);
+  // ارسال به خود کاربر
+  socketHandler.deletePost(req, postId, user._id);
+});
+
+// ============================================================
+// بخش ۶: کنترلر دریافت یک پست خاص (Retrieve Single Post)
+// ============================================================
+
+/**
+ * @function retrievePost
+ * @description دریافت اطلاعات کامل یک پست به همراه رأی‌ها، نویسنده و نظرات
+ * @route GET /api/posts/:postId
+ */
+module.exports.retrievePost = asyncHandler(async (req, res) => {
   const { postId } = req.params;
-  try {
-    // استفاده از پایپ‌لاین تجمیع (Aggregation Pipeline) مونگوس
-    // برای دریافت پست به همراه رأی‌ها و اطلاعات نویسنده
-    const post = await Post.aggregate([
-      // مرحله ۱: فقط پستی با شناسه مورد نظر را پیدا کن
-      { $match: { _id: ObjectId(postId) } },
-      // مرحله ۲: اطلاعات رأی‌های این پست را از مجموعه postvotes دریافت کن
-      {
-        $lookup: {
-          from: 'postvotes',          // نام مجموعه در دیتابیس
-          localField: '_id',           // فیلد موجود در سند پست
-          foreignField: 'post',        // فیلد معادل در سند رأی
-          as: 'postVotes',            // نام فیلد جدید برای ذخیره نتایج
-        },
+
+  if (!isValidObjectId(postId)) {
+    return res.status(400).json({
+      success: false,
+      error: 'شناسه پست نامعتبر است.',
+    });
+  }
+
+  const postArray = await Post.aggregate([
+    { $match: { _id: ObjectId(postId) } },
+    {
+      $lookup: {
+        from: 'postvotes',
+        localField: '_id',
+        foreignField: 'post',
+        as: 'postVotes',
       },
-      // مرحله ۳: اطلاعات نویسنده پست را از مجموعه users دریافت کن
-      {
-        $lookup: {
-          from: 'users',
-          localField: 'author',
-          foreignField: '_id',
-          as: 'author',
-        },
-      },
-      // مرحله ۴: آرایه author را به یک شیء تبدیل کن (چون فقط یک نویسنده داریم)
-      { $unwind: '$author' },
-      // مرحله ۵: آرایه postVotes را هم به یک شیء تبدیل کن
-      { $unwind: '$postVotes' },
-      // مرحله ۶: فیلدهای حساس کاربر را از خروجی حذف کن
-      {
-        $unset: [
-          'author.password',
-          'author.email',
-          'author.private',
-          'author.bio',
-          'author.githubId',
+    },
+    { $unwind: { path: '$postVotes', preserveNullAndEmptyArrays: true } },
+    {
+      $lookup: {
+        from: 'users',
+        localField: 'author',
+        foreignField: '_id',
+        pipeline: [
+          { $project: { username: 1, avatar: 1, fullName: 1 } },
         ],
+        as: 'author',
       },
-      // مرحله ۷: فقط آرایه votes از سند postVotes را نگه دار
-      {
-        $addFields: { postVotes: '$postVotes.votes' },
+    },
+    { $unwind: { path: '$author', preserveNullAndEmptyArrays: true } },
+    {
+      $addFields: {
+        postVotes: { $ifNull: ['$postVotes.votes', []] },
       },
-    ]);
-    
-    if (post.length === 0) {
-      return res
-        .status(404)
-        .send({ error: 'پستی با این شناسه پیدا نشد.' });
-    }
-    
-    // دریافت نظرات مرتبط با این پست
-    const comments = await retrieveComments(postId, 0);
+    },
+  ]);
 
-    // ارسال اطلاعات کامل پست به همراه نظرات
-    return res.send({ ...post[0], commentData: comments });
-  } catch (err) {
-    next(err);
+  if (!postArray.length) {
+    return res.status(404).json({
+      success: false,
+      error: 'پستی با این شناسه یافت نشد.',
+    });
   }
-};
 
-// ==========================================
-// تابع: رأی دادن به پست (Vote Post - لایک/دیسلایک)
-// این تابع بدون تغییر باقی می‌ماند
-// ==========================================
-module.exports.votePost = async (req, res, next) => {
+  const comments = await retrieveComments(postId, 0);
+
+  return res.status(200).json({
+    success: true,
+    data: { ...postArray[0], commentData: comments },
+  });
+});
+
+// ============================================================
+// بخش ۷: کنترلر رأی (لایک/دیسلایک) پست
+// ============================================================
+
+/**
+ * @function votePost
+ * @description رأی دادن یا لغو رأی به یک پست (Toggle Like)
+ * @route POST /api/posts/:postId/vote
+ * @middleware requireAuth
+ */
+module.exports.votePost = asyncHandler(async (req, res) => {
   const { postId } = req.params;
   const user = res.locals.user;
 
-  try {
-    // تلاش برای اضافه کردن رأی کاربر به آرایه votes
-    // شرط $ne: user._id یعنی اگر قبلاً رأی نداده باشد
-    const postLikeUpdate = await PostVote.updateOne(
-      { post: postId, 'votes.author': { $ne: user._id } },
-      {
-        $push: { votes: { author: user._id } },
-      }
-    );
-    
-    if (!postLikeUpdate.nModified) {
-      if (!postLikeUpdate.ok) {
-        return res.status(500).send({ error: 'خطا در ثبت رأی.' });
-      }
-      
-      // اگر هیچ سندی تغییر نکرد، یعنی کاربر قبلاً رأی داده بوده
-      // پس باید رأی او را حذف کنیم (دیسلایک)
-      const postDislikeUpdate = await PostVote.updateOne(
-        { post: postId },
-        { $pull: { votes: { author: user._id } } }
-      );
-
-      if (!postDislikeUpdate.nModified) {
-        return res.status(500).send({ error: 'خطا در حذف رأی.' });
-      }
-    } else {
-      // ==========================================
-      // بخش ارسال نوتیفیکیشن لایک (با تغییر جزئی)
-      // ==========================================
-      const post = await Post.findById(postId);
-      
-      // فقط اگر لایک‌کننده خود نویسنده پست نباشد، نوتیفیکیشن بفرست
-      if (String(post.author) !== String(user._id)) {
-        // ==========================================
-        // تغییر: استفاده از مسیر محلی برای بندانگشتی نوتیفیکیشن
-        // ==========================================
-        // قبلاً: const image = formatCloudinaryUrl(post.image, {...}, true);
-        // حالا از تابع ساده خودمان استفاده می‌کنیم
-        const image = formatLocalThumbnailUrl(post.image);
-        
-        const notification = new Notification({
-          sender: user._id,            // فرستنده نوتیفیکیشن (کسی که لایک کرده)
-          receiver: post.author,       // گیرنده نوتیفیکیشن (نویسنده پست)
-          notificationType: 'like',    // نوع نوتیفیکیشن
-          date: Date.now(),           // زمان ایجاد
-          notificationData: {
-            postId,
-            image,                     // مسیر بندانگشتی عکس
-            filter: post.filter,       // فیلتر اعمال شده روی عکس
-          },
-        });
-
-        await notification.save();
-        
-        // ارسال نوتیفیکیشن به صورت زنده از طریق وب‌سوکت
-        socketHandler.sendNotification(req, {
-          ...notification.toObject(),
-          sender: {
-            _id: user._id,
-            username: user.username,
-            avatar: user.avatar,
-          },
-        });
-      }
-    }
-    return res.send({ success: true });
-  } catch (err) {
-    next(err);
+  if (!isValidObjectId(postId)) {
+    return res.status(400).json({
+      success: false,
+      error: 'شناسه پست نامعتبر است.',
+    });
   }
-};
 
-// ==========================================
-// تابع: دریافت فید پست‌ها (Retrieve Post Feed)
-// این تابع بدون تغییر باقی می‌ماند
-// ==========================================
-module.exports.retrievePostFeed = async (req, res, next) => {
+  // بررسی وجود پست
+  const post = await Post.findById(postId).select('author image thumbnail filter');
+  if (!post) {
+    return res.status(404).json({
+      success: false,
+      error: 'پستی با این شناسه یافت نشد.',
+    });
+  }
+
+  // تلاش برای افزودن رأی (با استفاده از $push با شرط عدم وجود)
+  const addResult = await PostVote.updateOne(
+    { post: ObjectId(postId), 'votes.author': { $ne: user._id } },
+    { $push: { votes: { author: user._id } } }
+  );
+
+  if (addResult.modifiedCount > 0) {
+    // رأی اضافه شد - ارسال نوتیفیکیشن
+    await sendLikeNotification(req, user, post);
+
+    return res.status(200).json({
+      success: true,
+      message: 'پست لایک شد.',
+      data: { operation: 'like' },
+    });
+  }
+
+  // رأی قبلاً وجود داشت - حذف آن
+  const removeResult = await PostVote.updateOne(
+    { post: ObjectId(postId) },
+    { $pull: { votes: { author: user._id } } }
+  );
+
+  if (removeResult.modifiedCount === 0) {
+    return res.status(500).json({
+      success: false,
+      error: 'عملیات دیسلایک با خطا مواجه شد.',
+    });
+  }
+
+  return res.status(200).json({
+    success: true,
+    message: 'لایک پست برداشته شد.',
+    data: { operation: 'unlike' },
+  });
+});
+
+// ============================================================
+// بخش ۸: کنترلر دریافت فید پست‌ها (Post Feed)
+// ============================================================
+
+/**
+ * @function retrievePostFeed
+ * @description دریافت فید پست‌های کاربر بر اساس دنبال‌شونده‌ها
+ * @route GET /api/posts/feed?offset=0
+ * @middleware requireAuth
+ */
+module.exports.retrievePostFeed = asyncHandler(async (req, res) => {
   const user = res.locals.user;
-  const { offset } = req.params;
+  const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
 
-  try {
-    const followingDocument = await Following.findOne({ user: user._id });
-    if (!followingDocument) {
-      return res.status(404).send({ error: 'هیچ پستی برای نمایش پیدا نشد.' });
-    }
-    const following = followingDocument.following.map(
-      (following) => following.user
-    );
-
-    const unwantedUserFields = [
-      'author.password',
-      'author.private',
-      'author.confirmed',
-      'author.bookmarks',
-      'author.email',
-      'author.website',
-      'author.bio',
-      'author.githubId',
-    ];
-
-    const posts = await Post.aggregate([
-      {
-        $match: {
-          $or: [{ author: { $in: following } }, { author: ObjectId(user._id) }],
-        },
-      },
+  const followingDoc = await Following.findOne({ user: user._id }).lean();
+  if (!followingDoc?.following?.length) {
+    // اگر کاربر کسی را دنبال نمی‌کند، پست‌های خودش را نمایش ده
+    const ownPosts = await Post.aggregate([
+      { $match: { author: ObjectId(user._id) } },
       { $sort: { date: -1 } },
-      { $skip: Number(offset) },
-      { $limit: 5 },
-      {
-        $lookup: {
-          from: 'users',
-          localField: 'author',
-          foreignField: '_id',
-          as: 'author',
-        },
-      },
-      {
-        $lookup: {
-          from: 'postvotes',
-          localField: '_id',
-          foreignField: 'post',
-          as: 'postVotes',
-        },
-      },
-      {
-        $lookup: {
-          from: 'comments',
-          let: { postId: '$_id' },
-          pipeline: [
-            {
-              $match: {
-                $expr: {
-                  $eq: ['$post', '$$postId'],
-                },
-              },
-            },
-            { $sort: { date: -1 } },
-            { $limit: 3 },
-            {
-              $lookup: {
-                from: 'users',
-                localField: 'author',
-                foreignField: '_id',
-                as: 'author',
-              },
-            },
-            {
-              $lookup: {
-                from: 'commentvotes',
-                localField: '_id',
-                foreignField: 'comment',
-                as: 'commentVotes',
-              },
-            },
-            {
-              $unwind: '$author',
-            },
-            {
-              $unwind: {
-                path: '$commentVotes',
-                preserveNullAndEmptyArrays: true,
-              },
-            },
-            {
-              $unset: unwantedUserFields,
-            },
-            {
-              $addFields: {
-                commentVotes: '$commentVotes.votes',
-              },
-            },
-          ],
-          as: 'comments',
-        },
-      },
-      {
-        $lookup: {
-          from: 'comments',
-          let: { postId: '$_id' },
-          pipeline: [
-            {
-              $match: {
-                $expr: {
-                  $eq: ['$post', '$$postId'],
-                },
-              },
-            },
-            {
-              $group: { _id: null, count: { $sum: 1 } },
-            },
-            {
-              $project: {
-                _id: false,
-              },
-            },
-          ],
-          as: 'commentCount',
-        },
-      },
-      {
-        $unwind: {
-          path: '$commentCount',
-          preserveNullAndEmptyArrays: true,
-        },
-      },
-      {
-        $unwind: '$postVotes',
-      },
-      {
-        $unwind: '$author',
-      },
-      {
-        $addFields: {
-          postVotes: '$postVotes.votes',
-          commentData: {
-            comments: '$comments',
-            commentCount: '$commentCount.count',
-          },
-        },
-      },
-      {
-        $unset: [...unwantedUserFields, 'comments', 'commentCount'],
-      },
-    ]);
-    return res.send(posts);
-  } catch (err) {
-    next(err);
-  }
-};
-
-// ==========================================
-// تابع: دریافت پست‌های پیشنهادی (Retrieve Suggested Posts)
-// این تابع بدون تغییر باقی می‌ماند
-// ==========================================
-module.exports.retrieveSuggestedPosts = async (req, res, next) => {
-  const { offset = 0 } = req.params;
-
-  try {
-    const posts = await Post.aggregate([
-      {
-        $sort: { date: -1 },
-      },
-      {
-        $skip: Number(offset),
-      },
-      {
-        $limit: 20,
-      },
-      {
-        $sample: { size: 20 },
-      },
+      { $skip: offset },
+      { $limit: FEED_PAGE_SIZE },
       ...populatePostsPipeline,
     ]);
-    return res.send(posts);
-  } catch (err) {
-    next(err);
+
+    return res.status(200).json({
+      success: true,
+      data: ownPosts,
+    });
   }
-};
 
-// ==========================================
-// تابع: دریافت پست‌های یک هشتگ خاص (Retrieve Hashtag Posts)
-// این تابع بدون تغییر باقی می‌ماند
-// ==========================================
-module.exports.retrieveHashtagPosts = async (req, res, next) => {
-  const { hashtag, offset } = req.params;
+  const followingIds = followingDoc.following.map((f) => f.user);
 
-  try {
-    const posts = await Post.aggregate([
-      {
-        $facet: {
-          posts: [
-            {
-              $match: { hashtags: hashtag },
+  const posts = await Post.aggregate([
+    {
+      $match: {
+        $or: [
+          { author: { $in: followingIds.map((id) => ObjectId(id)) } },
+          { author: ObjectId(user._id) },
+        ],
+      },
+    },
+    { $sort: { date: -1 } },
+    { $skip: offset },
+    { $limit: FEED_PAGE_SIZE },
+    {
+      $lookup: {
+        from: 'users',
+        localField: 'author',
+        foreignField: '_id',
+        pipeline: [{ $project: { username: 1, avatar: 1, fullName: 1 } }],
+        as: 'author',
+      },
+    },
+    { $unwind: { path: '$author', preserveNullAndEmptyArrays: true } },
+    {
+      $lookup: {
+        from: 'postvotes',
+        localField: '_id',
+        foreignField: 'post',
+        as: 'postVotes',
+      },
+    },
+    { $unwind: { path: '$postVotes', preserveNullAndEmptyArrays: true } },
+    {
+      $lookup: {
+        from: 'comments',
+        let: { postId: '$_id' },
+        pipeline: [
+          { $match: { $expr: { $eq: ['$post', '$$postId'] } } },
+          { $sort: { date: -1 } },
+          { $limit: 3 },
+          {
+            $lookup: {
+              from: 'users',
+              localField: 'author',
+              foreignField: '_id',
+              pipeline: [{ $project: { username: 1, avatar: 1 } }],
+              as: 'author',
             },
-            {
-              $skip: Number(offset),
+          },
+          { $unwind: { path: '$author', preserveNullAndEmptyArrays: true } },
+          {
+            $lookup: {
+              from: 'commentvotes',
+              localField: '_id',
+              foreignField: 'comment',
+              as: 'commentVotes',
             },
-            {
-              $limit: 20,
-            },
-            ...populatePostsPipeline,
-          ],
-          postCount: [
-            {
-              $match: { hashtags: hashtag },
-            },
-            {
-              $group: {
-                _id: null,
-                count: { $sum: 1 },
-              },
-            },
-          ],
+          },
+          { $unwind: { path: '$commentVotes', preserveNullAndEmptyArrays: true } },
+          { $addFields: { commentVotes: { $ifNull: ['$commentVotes.votes', []] } } },
+        ],
+        as: 'comments',
+      },
+    },
+    {
+      $lookup: {
+        from: 'comments',
+        let: { postId: '$_id' },
+        pipeline: [
+          { $match: { $expr: { $eq: ['$post', '$$postId'] } } },
+          { $group: { _id: null, count: { $sum: 1 } } },
+        ],
+        as: 'commentCount',
+      },
+    },
+    { $unwind: { path: '$commentCount', preserveNullAndEmptyArrays: true } },
+    {
+      $addFields: {
+        postVotes: { $ifNull: ['$postVotes.votes', []] },
+        commentData: {
+          comments: '$comments',
+          commentCount: { $ifNull: ['$commentCount.count', 0] },
         },
       },
-      {
-        $unwind: '$postCount',
-      },
-      {
-        $addFields: {
-          postCount: '$postCount.count',
-        },
-      },
-    ]);
+    },
+    { $unset: ['comments', 'commentCount'] },
+  ]);
 
-    return res.send(posts[0]);
-  } catch (err) {
-    next(err);
+  return res.status(200).json({
+    success: true,
+    data: posts,
+    pagination: {
+      offset,
+      limit: FEED_PAGE_SIZE,
+      hasMore: posts.length === FEED_PAGE_SIZE,
+    },
+  });
+});
+
+// ============================================================
+// بخش ۹: کنترلر دریافت پست‌های پیشنهادی (Suggested Posts)
+// ============================================================
+
+/**
+ * @function retrieveSuggestedPosts
+ * @description دریافت پست‌های تصادفی برای بخش اکسپلور
+ * @route GET /api/posts/suggested?offset=0
+ */
+module.exports.retrieveSuggestedPosts = asyncHandler(async (req, res) => {
+  const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+
+  const posts = await Post.aggregate([
+    { $sort: { date: -1 } },
+    { $skip: offset },
+    { $limit: SUGGESTED_PAGE_SIZE * 2 }, // دو برابر می‌گیریم
+    { $sample: { size: SUGGESTED_PAGE_SIZE } }, // سپس تصادفی انتخاب می‌کنیم
+    ...populatePostsPipeline,
+  ]);
+
+  return res.status(200).json({
+    success: true,
+    data: posts,
+    pagination: {
+      offset,
+      limit: SUGGESTED_PAGE_SIZE,
+      hasMore: posts.length === SUGGESTED_PAGE_SIZE,
+    },
+  });
+});
+
+// ============================================================
+// بخش ۱۰: کنترلر دریافت پست‌های یک هشتگ خاص
+// ============================================================
+
+/**
+ * @function retrieveHashtagPosts
+ * @description جستجوی پست‌ها بر اساس هشتگ
+ * @route GET /api/posts/hashtag/:hashtag?offset=0
+ */
+module.exports.retrieveHashtagPosts = asyncHandler(async (req, res) => {
+  const { hashtag } = req.params;
+  const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+
+  if (!hashtag || hashtag.trim().length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: 'لطفاً یک هشتگ برای جستجو وارد کنید.',
+    });
   }
-};
+
+  const cleanHashtag = hashtag.toLowerCase().trim();
+
+  const result = await Post.aggregate([
+    {
+      $facet: {
+        posts: [
+          { $match: { hashtags: cleanHashtag } },
+          { $sort: { date: -1 } },
+          { $skip: offset },
+          { $limit: HASHTAG_PAGE_SIZE },
+          ...populatePostsPipeline,
+        ],
+        totalCount: [
+          { $match: { hashtags: cleanHashtag } },
+          { $group: { _id: null, count: { $sum: 1 } } },
+        ],
+      },
+    },
+    { $unwind: { path: '$totalCount', preserveNullAndEmptyArrays: true } },
+    {
+      $addFields: {
+        totalCount: { $ifNull: ['$totalCount.count', 0] },
+      },
+    },
+  ]);
+
+  const data = result[0] || { posts: [], totalCount: 0 };
+
+  return res.status(200).json({
+    success: true,
+    data: data.posts,
+    totalCount: data.totalCount,
+    pagination: {
+      offset,
+      limit: HASHTAG_PAGE_SIZE,
+      hasMore: data.posts.length === HASHTAG_PAGE_SIZE,
+    },
+  });
+});
+
+module.exports = exports;
