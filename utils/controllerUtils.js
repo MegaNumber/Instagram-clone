@@ -1,9 +1,9 @@
 // مسیر فایل: /utils/controllerUtils.js
 // توضیح: توابع کمکی پرکاربرد در کنترلرها (بازیابی نظرات، ارسال ایمیل،
 // نوتیفیکیشن کامنت و منشن، تولید نام کاربری یکتا، پایپ‌لاین populate).
-// با حذف وابستگی به Cloudinary و هماهنگی کامل با مدل‌های جدید (timestamps).
+// کاملاً مستقل از سرویس‌های ابری و هماهنگ با مدل‌های جدید (timestamps).
 //
-// @version 2.5.0
+// @version 2.5.1
 // @since 2026
 
 const Comment = require('../models/Comment');
@@ -59,7 +59,7 @@ module.exports.retrieveComments = async (postId, offset = 0, exclude = 0) => {
         $facet: {
           comments: [
             { $match: { post: ObjectId(postId) } },
-            { $sort: { createdAt: -1 } },        // جدیدترین‌ها
+            { $sort: { createdAt: -1 } },        // جدیدترین‌ها اول
             { $skip: safeExclude },
             { $sort: { createdAt: 1 } },          // بازگشت به ترتیب صعودی
             { $skip: safeOffset },
@@ -171,7 +171,7 @@ module.exports.sendConfirmationEmail = async (username, email, confirmationToken
 // ============================================================
 module.exports.sendCommentNotification = async (req, sender, receiver, image, filter, message, postId) => {
   if (!req || !sender || !receiver || !postId) return;
-  if (String(sender._id) === String(receiver)) return; // خودش نباشد
+  if (String(sender._id) === String(receiver)) return; // به خودش اطلاع نده
 
   try {
     const notification = await Notification.create({
@@ -208,15 +208,18 @@ module.exports.sendMentionNotification = async (req, message, image, post, user)
 
   for (const mention of mentions) {
     const username = mention.substring(1).toLowerCase();
+
+    // از ارسال نوتیفیکیشن به خود شخص یا نویسندهٔ پست جلوگیری کن
     if (
       username === user.username.toLowerCase() ||
-      (post.author && username === post.author.username?.toLowerCase())
+      (post.author?.username && username === post.author.username.toLowerCase())
     ) continue;
 
     try {
       const receiver = await User.findOne({ username }).select('_id username avatar');
       if (!receiver) continue;
 
+      // جلوگیری از ارسال تکراری در کمتر از ۱ دقیقه
       const alreadySent = await Notification.exists({
         sender: user._id,
         receiver: receiver._id,
