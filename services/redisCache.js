@@ -1,12 +1,16 @@
 // مسیر فایل: /services/redisCache.js
 // توضیح: سرویس کش Redis با الگوی Cache-Aside + fallback خودکار.
-// بر اساس آخرین متدهای ۲۰۲۶: استفاده از ioredis، اتصال lazy،
-// و graceful degradation در صورت قطع Redis.
+// در صورت در دسترس نبودن Redis، به‌طور خودکار داده را مستقیماً
+// از دیتابیس دریافت می‌کند (graceful degradation).
+// از ioredis با اتصال lazy و retry strategy استفاده می‌کند.
+//
+// @version 2.5.0
+// @since 2026
 
 const Redis = require('ioredis');
 
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
-const DEFAULT_TTL = 300; // ۵ دقیقه
+const DEFAULT_TTL = parseInt(process.env.REDIS_DEFAULT_TTL, 10) || 300; // ۵ دقیقه
 
 class RedisCache {
     constructor() {
@@ -14,6 +18,9 @@ class RedisCache {
         this._enabled = process.env.REDIS_ENABLED !== 'false';
     }
 
+    /**
+     * دریافت (یا ایجاد) کلاینت Redis با استراتژی اتصال مجدد
+     */
     get client() {
         if (!this._enabled) return null;
         if (!this._client) {
@@ -33,9 +40,19 @@ class RedisCache {
     }
 
     /**
-     * دریافت داده از کش، در صورت عدم وجود اجرای fetcher و ذخیره در کش
+     * اتصال صریح (در صورت نیاز در startup)
+     */
+    async connect() {
+        if (this.client && this.client.status !== 'ready') {
+            await this.client.connect();
+            console.log('[RedisCache] Connected successfully');
+        }
+    }
+
+    /**
+     * دریافت از کش، در صورت عدم وجود اجرای fetcher و ذخیره
      * @param {string} key - کلید کش
-     * @param {function} fetcher - تابع دریافت داده از دیتابیس
+     * @param {function} fetcher - تابع async برای دریافت داده
      * @param {number} ttl - زمان انقضا (ثانیه)
      */
     async get(key, fetcher, ttl = DEFAULT_TTL) {
@@ -44,7 +61,7 @@ class RedisCache {
         }
         try {
             const cached = await this.client.get(key);
-            if (cached) {
+            if (cached !== null) {
                 return JSON.parse(cached);
             }
         } catch (err) {
@@ -52,7 +69,7 @@ class RedisCache {
         }
 
         const data = await fetcher();
-        if (data) {
+        if (data !== null && data !== undefined) {
             try {
                 await this.client.set(key, JSON.stringify(data), 'EX', ttl);
             } catch (err) {
@@ -63,8 +80,38 @@ class RedisCache {
     }
 
     /**
-     * حذف کلید(ها) از کش
-     * @param {string|string[]} keys - کلید یا آرایه کلیدها
+     * تنظیم مستقیم یک کلید
+     * @param {string} key
+     * @param {any} value
+     * @param {number} ttl
+     */
+    async set(key, value, ttl = DEFAULT_TTL) {
+        if (!this.client) return;
+        try {
+            await this.client.set(key, JSON.stringify(value), 'EX', ttl);
+        } catch (err) {
+            console.warn('[RedisCache] Set error:', err.message);
+        }
+    }
+
+    /**
+     * بررسی وجود کلید
+     * @param {string} key
+     * @returns {Promise<boolean>}
+     */
+    async exists(key) {
+        if (!this.client) return false;
+        try {
+            const result = await this.client.exists(key);
+            return result === 1;
+        } catch (err) {
+            return false;
+        }
+    }
+
+    /**
+     * حذف کلید(ها)
+     * @param {string|string[]} keys
      */
     async del(keys) {
         if (!this.client) return;
@@ -79,8 +126,8 @@ class RedisCache {
     }
 
     /**
-     * حذف تمام کلیدهای مطابق با الگو
-     * @param {string} pattern - الگوی glob
+     * حذف کلیدهای مطابق الگو
+     * @param {string} pattern - glob pattern
      */
     async delByPattern(pattern) {
         if (!this.client) return;
@@ -95,7 +142,10 @@ class RedisCache {
     }
 
     /**
-     * افزایش عددی یک کلید (برای rate limiting)
+     * افزایش عددی (برای rate limiting)
+     * @param {string} key
+     * @param {number} ttl
+     * @returns {Promise<number>}
      */
     async incr(key, ttl) {
         if (!this.client) return 1;
