@@ -110,7 +110,7 @@ module.exports.sendMessage = (req, message, receiverId) => {
 };
 
 /**
- * ارسال وضعیت تایپینگ
+ * ارسال وضعیت تایپینگ (نیازمند عضویت کلاینت‌ها در روم conversationId)
  * @param {object} req
  * @param {string} conversationId - شناسه مکالمه
  * @param {string} senderId - کاربری که تایپ می‌کند
@@ -120,8 +120,8 @@ module.exports.sendTypingStatus = (req, conversationId, senderId, isTyping = tru
   const io = getIO(req);
   if (!io || !conversationId) return;
 
+  // در سمت کلاینت، کاربران باید با socket.join(conversationId) عضو این روم شوند
   const event = isTyping ? EVENTS.TYPING : EVENTS.STOP_TYPING;
-  // ارسال به کل روم مکالمه (همه اعضا)
   io.to(conversationId).emit(event, {
     conversationId,
     userId: senderId,
@@ -129,7 +129,7 @@ module.exports.sendTypingStatus = (req, conversationId, senderId, isTyping = tru
 };
 
 /**
- * اطلاع‌رسانی آنلاین/آفلاین شدن کاربر (می‌توان در connection/disconnect استفاده کرد)
+ * اطلاع‌رسانی آنلاین/آفلاین شدن کاربر
  * @param {object} io - نمونه Socket.io
  * @param {string} userId - کاربر هدف
  * @param {boolean} online
@@ -137,8 +137,7 @@ module.exports.sendTypingStatus = (req, conversationId, senderId, isTyping = tru
 module.exports.notifyOnlineStatus = (io, userId, online = true) => {
   if (!io || !userId) return;
   const event = online ? EVENTS.USER_ONLINE : EVENTS.USER_OFFLINE;
-  // معمولاً به همه کاربران (broadcast) یا به لیست دوستان ارسال می‌شود
-  // در اینجا به‌عنوان مثال به همه ارسال می‌کنیم
+  // به همه کلاینت‌ها ارسال می‌شود (می‌توان به لیست دوستان محدود کرد)
   io.emit(event, { userId, online });
 };
 
