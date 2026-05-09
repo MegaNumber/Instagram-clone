@@ -2,11 +2,11 @@
 // توضیح: موتور رتبه‌بندی چندسطحی شبیه‌سازی‌شده از الگوریتم اینستاگرام.
 // بر اساس مستندات رسمی Meta Engineering (2024-2026)، این ماژول
 // سیگنال‌های کلیدی رتبه‌بندی را برای چهار سطح (Feed, Explore, Reels, Stories)
-// پیاده‌سازی می‌کند.
+// پیاده‌سازی می‌کند. از کش‌های داخلی برای بهینه‌سازی کوئری‌های تکراری استفاده می‌کند.
+//
+// @version 2.5.1
+// @since 2026
 
-// ============================================================
-// بخش ۱: ایمپورت ماژول‌های مورد نیاز
-// ============================================================
 const mongoose = require('mongoose');
 const ObjectId = mongoose.Types.ObjectId;
 const User = require('../models/User');
@@ -16,225 +16,151 @@ const Comment = require('../models/Comment');
 const Followers = require('../models/Followers');
 const Following = require('../models/Following');
 const Notification = require('../models/Notification');
-const Reel = require('../models/Reel');
-const Story = require('../models/Story');
 
 // ============================================================
-// بخش ۲: ثابت‌های پیکربندی (بر اساس تحقیقات واقعی)
+// ثابت‌های پیکربندی (مقادیر واقعی از تحلیل رفتار الگوریتم)
 // ============================================================
-// وزن‌های سیگنال‌های رتبه‌بندی - برگرفته از تحلیل رفتار الگوریتم اینستاگرام[reference:5]
 const SIGNAL_WEIGHTS = {
-  // Feed
-  FEED_RELATIONSHIP: 0.30,       // قدرت رابطه (بیشترین وزن در Feed)[reference:6]
-  FEED_INTEREST: 0.25,           // احتمال تعامل بر اساس تاریخچه[reference:7]
-  FEED_RECENCY: 0.20,            // تازگی محتوا
-  FEED_ENGAGEMENT_VELOCITY: 0.15,// سرعت دریافت تعامل[reference:8]
-  FEED_CONTENT_QUALITY: 0.10,    // کیفیت محتوا (نسبت تعامل)
+  FEED_RELATIONSHIP: 0.30,
+  FEED_INTEREST: 0.25,
+  FEED_RECENCY: 0.20,
+  FEED_ENGAGEMENT_VELOCITY: 0.15,
+  FEED_CONTENT_QUALITY: 0.10,
 
-  // Explore
-  EXPLORE_POPULARITY: 0.40,      // محبوبیت (مهم‌ترین در Explore)[reference:9]
-  EXPLORE_INTEREST_MATCH: 0.35,  // تطابق با علایق کاربر[reference:10]
-  EXPLORE_ENGAGEMENT_DEPTH: 0.15,// عمق تعامل (ذخیره، اشتراک)[reference:11]
-  EXPLORE_CONTENT_FRESHNESS: 0.10,// تازگی محتوا
+  EXPLORE_POPULARITY: 0.40,
+  EXPLORE_INTEREST_MATCH: 0.35,
+  EXPLORE_ENGAGEMENT_DEPTH: 0.15,
+  EXPLORE_CONTENT_FRESHNESS: 0.10,
 
-  // Reels
-  REELS_WATCH_TIME: 0.35,        // زمان تماشا (مهم‌ترین در Reels)[reference:12]
-  REELS_SENDS: 0.30,             // دفعات ارسال (وزن ۳-۵ برابر لایک)[reference:13]
-  REELS_LIKES: 0.15,             // لایک
-  REELS_RETENTION: 0.10,         // نرخ ماندگاری (retention)
-  REELS_RECENCY: 0.10,           // تازگی
+  REELS_WATCH_TIME: 0.35,
+  REELS_SENDS: 0.30,
+  REELS_LIKES: 0.15,
+  REELS_RETENTION: 0.10,
+  REELS_RECENCY: 0.10,
 
-  // Stories
-  STORY_VIEWING_HISTORY: 0.40,   // سابقه مشاهده استوری[reference:14]
-  STORY_CLOSENESS: 0.35,         // نزدیکی رابطه[reference:15]
-  STORY_RECENCY: 0.15,           // تازگی
-  STORY_ENGAGEMENT: 0.10,        // تعامل (پاسخ به استوری)
+  STORY_VIEWING_HISTORY: 0.40,
+  STORY_CLOSENESS: 0.35,
+  STORY_RECENCY: 0.15,
+  STORY_ENGAGEMENT: 0.10,
 };
 
-// ثابت‌های زمانی
-const RECENCY_DECAY_FACTOR = 0.8;      // ضریب کاهش امتیاز تازگی در هر ساعت
-const ENGAGEMENT_VELOCITY_WINDOW = 60;  // پنجره سرعت تعامل (دقیقه)[reference:16]
-const MAX_FEED_POSTS = 500;            // حداکثر پست برای ارزیابی[reference:17]
-const MAX_EXPLORE_CANDIDATES = 1500;   // حداکثر کاندید Explore[reference:18]
+const RECENCY_DECAY_FACTOR = 0.8;
+const ENGAGEMENT_VELOCITY_WINDOW = 60;
 
 // ============================================================
-// بخش ۳: کلاس موتور رتبه‌بندی
+// کلاس موتور رتبه‌بندی (Singleton)
 // ============================================================
 class RankingEngine {
   constructor() {
+    // کش‌های داخلی برای کاهش کوئری‌های تکراری
+    this._relationshipCache = new Map();
+    this._postVoteCache = new Map();
+    this._commentCountCache = new Map();
     console.log('[RankingEngine] Initialized with Instagram-based signal weights');
   }
 
   // ==========================================================
-  // ۳.۱ محاسبه امتیاز رابطه (Relationship Score)
+  // ۳.۱ رابطۀ دو کاربر (Relationship Score)
   // ==========================================================
-  /**
-   * محاسبه قدرت رابطه بین دو کاربر بر اساس سیگنال‌های:
-   * - دفعات لایک متقابل
-   * - دفعات کامنت‌گذاری متقابل
-   * - DM (در صورت وجود)
-   * - بازدید پروفایل (در صورت ردیابی)
-   * برگرفته از: Instagram Feed Ranking Signals[reference:19]
-   */
   async calculateRelationshipScore(userId, targetUserId) {
-    try {
-      if (userId.toString() === targetUserId.toString()) return 1.0; // خود کاربر
+    if (userId.toString() === targetUserId.toString()) return 1.0;
+    const cacheKey = `${userId}_${targetUserId}`;
+    if (this._relationshipCache.has(cacheKey)) {
+      return this._relationshipCache.get(cacheKey);
+    }
 
+    try {
       const uid = ObjectId(userId);
       const tid = ObjectId(targetUserId);
 
-      // ۱. تعداد لایک‌های کاربر روی پست‌های target
-      const targetPosts = await Post.find({ author: tid }).select('_id').lean();
-      const targetPostIds = targetPosts.map(p => p._id);
-      const likeCount = targetPostIds.length > 0
-        ? await PostVote.countDocuments({
-            post: { $in: targetPostIds },
-            'votes.author': uid,
-          })
-        : 0;
+      const targetPostIds = (await Post.find({ author: tid }).select('_id').lean()).map(p => p._id);
+      const [likeCount, commentCount, isFollowed, isFollowing, mutualNotifications] = await Promise.all([
+        targetPostIds.length ? PostVote.countDocuments({ post: { $in: targetPostIds }, 'votes.author': uid }) : 0,
+        targetPostIds.length ? Comment.countDocuments({ post: { $in: targetPostIds }, author: uid }) : 0,
+        Followers.exists({ user: tid, 'followers.user': uid }),
+        Following.exists({ user: uid, 'following.user': tid }),
+        Notification.countDocuments({ $or: [{ sender: uid, receiver: tid }, { sender: tid, receiver: uid }] }),
+      ]);
 
-      // ۲. تعداد کامنت‌های کاربر روی پست‌های target
-      const commentCount = targetPostIds.length > 0
-        ? await Comment.countDocuments({
-            post: { $in: targetPostIds },
-            author: uid,
-          })
-        : 0;
+      const score = Math.min(
+        Math.min(likeCount / 50, 1.0) * 0.25 +
+        Math.min(commentCount / 20, 1.0) * 0.25 +
+        ((isFollowed ? 1 : 0) + (isFollowing ? 1 : 0)) / 2 * 0.30 +
+        Math.min(mutualNotifications / 30, 1.0) * 0.20,
+        1.0
+      );
 
-      // ۳. آیا target کاربر را دنبال می‌کند؟
-      const isFollowed = await Followers.exists({
-        user: tid,
-        'followers.user': uid,
-      });
-
-      // ۴. آیا کاربر target را دنبال می‌کند؟
-      const isFollowing = await Following.exists({
-        user: uid,
-        'following.user': tid,
-      });
-
-      // ۵. تعداد نوتیفیکیشن‌های متقابل (به عنوان proxy برای DM)
-      const mutualNotifications = await Notification.countDocuments({
-        $or: [
-          { sender: uid, receiver: tid },
-          { sender: tid, receiver: uid },
-        ],
-      });
-
-      // نرمال‌سازی و محاسبه امتیاز
-      const likeScore = Math.min(likeCount / 50, 1.0) * 0.25;
-      const commentScore = Math.min(commentCount / 20, 1.0) * 0.25;
-      const followScore = ((isFollowed ? 1 : 0) + (isFollowing ? 1 : 0)) / 2 * 0.30;
-      const mutualScore = Math.min(mutualNotifications / 30, 1.0) * 0.20;
-
-      return Math.min(likeScore + commentScore + followScore + mutualScore, 1.0);
+      this._relationshipCache.set(cacheKey, score);
+      return score;
     } catch (err) {
-      console.error('[RelationshipScore] Error:', err.message);
-      return 0.1; // حداقل امتیاز
-    }
-  }
-
-  // ==========================================================
-  // ۳.۲ محاسبه امتیاز علاقه (Interest Score)
-  // ==========================================================
-  /**
-   * محاسبه احتمال تعامل کاربر با یک محتوا بر اساس:
-   * - تاریخچه تعامل با هشتگ‌های مشابه
-   * - تاریخچه تعامل با نویسنده
-   * - نوع محتوای مورد علاقه (image vs video)
-   * برگرفته از: Instagram Feed Ranking Signals[reference:20]
-   */
-  async calculateInterestScore(userId, post) {
-    try {
-      const uid = ObjectId(userId);
-
-      // ۱. امتیاز تطابق هشتگ - کاربر چقدر با هشتگ‌های این پست تعامل داشته
-      let hashtagScore = 0;
-      if (post.hashtags && post.hashtags.length > 0) {
-        const interactedPosts = await Post.find({
-          hashtags: { $in: post.hashtags },
-        }).select('_id').lean();
-        const interactedPostIds = interactedPosts.map(p => p._id);
-
-        if (interactedPostIds.length > 0) {
-          const interactions = await PostVote.countDocuments({
-            post: { $in: interactedPostIds },
-            'votes.author': uid,
-          });
-          hashtagScore = Math.min(interactions / 20, 1.0);
-        }
-      }
-
-      // ۲. امتیاز تعامل با نویسنده
-      let authorScore = 0;
-      if (post.author) {
-        const authorId = post.author._id || post.author;
-        const authorPosts = await Post.find({ author: authorId }).select('_id').lean();
-        const authorPostIds = authorPosts.map(p => p._id);
-
-        if (authorPostIds.length > 0) {
-          const authorInteractions = await PostVote.countDocuments({
-            post: { $in: authorPostIds },
-            'votes.author': uid,
-          }) + await Comment.countDocuments({
-            post: { $in: authorPostIds },
-            author: uid,
-          });
-          authorScore = Math.min(authorInteractions / 15, 1.0);
-        }
-      }
-
-      // ۳. امتیاز تازگی - محتوای جدیدتر امتیاز بیشتری دارد
-      const ageHours = (Date.now() - new Date(post.createdAt).getTime()) / (1000 * 60 * 60);
-      const recencyScore = Math.exp(-RECENCY_DECAY_FACTOR * ageHours / 24);
-
-      return (hashtagScore * 0.40 + authorScore * 0.35 + recencyScore * 0.25);
-    } catch (err) {
-      console.error('[InterestScore] Error:', err.message);
+      console.error(`[RelationshipScore] Error for ${userId}-${targetUserId}:`, err.message);
       return 0.1;
     }
   }
 
   // ==========================================================
-  // ۳.۳ محاسبه سرعت تعامل (Engagement Velocity)
+  // ۳.۲ علاقۀ کاربر به محتوا (Interest Score)
   // ==========================================================
-  /**
-   * اندازه‌گیری سرعت دریافت تعامل در دقایق اولیه انتشار
-   * این سیگنال برای Explore حیاتی است[reference:21]
-   */
+  async calculateInterestScore(userId, post) {
+    try {
+      const uid = ObjectId(userId);
+      let hashtagScore = 0, authorScore = 0;
+
+      if (post.hashtags?.length) {
+        const interactedPostIds = (await Post.find({ hashtags: { $in: post.hashtags } }).select('_id').lean()).map(p => p._id);
+        if (interactedPostIds.length) {
+          const interactions = await PostVote.countDocuments({ post: { $in: interactedPostIds }, 'votes.author': uid });
+          hashtagScore = Math.min(interactions / 20, 1.0);
+        }
+      }
+
+      if (post.author) {
+        const authorId = post.author._id || post.author;
+        const authorPostIds = (await Post.find({ author: authorId }).select('_id').lean()).map(p => p._id);
+        if (authorPostIds.length) {
+          const authorInteractions = await PostVote.countDocuments({ post: { $in: authorPostIds }, 'votes.author': uid })
+            + await Comment.countDocuments({ post: { $in: authorPostIds }, author: uid });
+          authorScore = Math.min(authorInteractions / 15, 1.0);
+        }
+      }
+
+      const ageHours = (Date.now() - new Date(post.createdAt).getTime()) / (1000 * 60 * 60);
+      const recencyScore = Math.exp(-RECENCY_DECAY_FACTOR * ageHours / 24);
+
+      return hashtagScore * 0.40 + authorScore * 0.35 + recencyScore * 0.25;
+    } catch (err) {
+      console.error(`[InterestScore] Error for post ${post._id}:`, err.message);
+      return 0.1;
+    }
+  }
+
+  // ==========================================================
+  // ۳.۳ سرعت تعامل (Engagement Velocity)
+  // ==========================================================
   async calculateEngagementVelocity(postId) {
     try {
       const post = await Post.findById(postId).select('createdAt').lean();
       if (!post) return 0;
 
       const ageMinutes = (Date.now() - new Date(post.createdAt).getTime()) / (1000 * 60);
-      if (ageMinutes < 1) return 0.5; // پست‌های جدید یک امتیاز پایه دارند
+      if (ageMinutes < 1) return 0.5;
 
-      // تعداد تعاملات در ۶۰ دقیقه اول
-      const voteCount = await PostVote.findOne({ post: postId }).lean();
-      const totalVotes = voteCount?.votes?.length || 0;
-      const commentCount = await Comment.countDocuments({ post: postId });
+      const [voteDoc, commentCount] = await Promise.all([
+        PostVote.findOne({ post: postId }).lean(),
+        Comment.countDocuments({ post: postId }),
+      ]);
 
-      // سرعت = تعاملات / زمان
-      const totalEngagement = totalVotes + commentCount;
-      const velocity = totalEngagement / Math.max(ageMinutes, 1);
-
-      // نرمال‌سازی: ۱ تعامل در دقیقه = امتیاز ۰.۵
-      return Math.min(velocity / 2, 1.0);
+      const totalEngagement = (voteDoc?.votes?.length || 0) + (commentCount || 0);
+      return Math.min(totalEngagement / Math.max(ageMinutes, 1) / 2, 1.0);
     } catch (err) {
-      console.error('[EngagementVelocity] Error:', err.message);
+      console.error(`[EngagementVelocity] Error for ${postId}:`, err.message);
       return 0;
     }
   }
 
   // ==========================================================
-  // ۳.۴ محاسبه عمق تعامل (Engagement Depth)
+  // ۳.۴ عمق تعامل (Engagement Depth)
   // ==========================================================
-  /**
-   * وزن‌دهی به نوع تعامل:
-   * - ذخیره (Save) > اشتراک (Share) > کامنت > لایک
-   * برگرفته از:[reference:22]
-   */
   async calculateEngagementDepth(postId) {
     try {
       const [post, voteDoc, commentCount] = await Promise.all([
@@ -243,30 +169,20 @@ class RankingEngine {
         Comment.countDocuments({ post: postId }),
       ]);
 
-      const likeCount = voteDoc?.votes?.length || 0;
-      const bookmarkCount = post?.bookmarks?.length || 0; // به عنوان proxy برای save
+      const weightedScore = (voteDoc?.votes?.length || 0) * 1
+        + (commentCount || 0) * 2
+        + (post?.bookmarks?.length || 0) * 4;
 
-      // وزن‌دهی: Save(4x) > Share(3x) > Comment(2x) > Like(1x)
-      const weightedScore = (
-        (likeCount * 1) +
-        (commentCount * 2) +
-        (bookmarkCount * 4) // save بیشترین وزن را دارد[reference:23]
-      );
-
-      // نرمال‌سازی
       return Math.min(weightedScore / 100, 1.0);
     } catch (err) {
-      console.error('[EngagementDepth] Error:', err.message);
+      console.error(`[EngagementDepth] Error for ${postId}:`, err.message);
       return 0;
     }
   }
 
   // ==========================================================
-  // ۳.۵ محاسبه امتیاز کیفیت محتوا
+  // ۳.۵ کیفیت محتوا (Engagement Rate)
   // ==========================================================
-  /**
-   * نسبت تعامل به بازدید (Engagement Rate)
-   */
   async calculateContentQuality(postId) {
     try {
       const [post, voteDoc, commentCount] = await Promise.all([
@@ -274,145 +190,108 @@ class RankingEngine {
         PostVote.findOne({ post: postId }).lean(),
         Comment.countDocuments({ post: postId }),
       ]);
-
       const views = post?.views || 1;
-      const likes = voteDoc?.votes?.length || 0;
-      const engagementRate = (likes + commentCount) / views;
-
-      return Math.min(engagementRate * 5, 1.0); // 20% engagement = perfect score
+      return Math.min(((voteDoc?.votes?.length || 0) + (commentCount || 0)) / views * 5, 1.0);
     } catch (err) {
       return 0.1;
     }
   }
 
   // ==========================================================
-  // ۳.۶ محاسبه امتیاز محبوبیت (برای Explore)
+  // ۳.۶ محبوبیت (برای Explore)
   // ==========================================================
-  /**
-   * محبوبیت کلی یک پست در پلتفرم[reference:24]
-   */
   async calculatePopularityScore(postId) {
     try {
       const [voteDoc, commentCount] = await Promise.all([
         PostVote.findOne({ post: postId }).lean(),
         Comment.countDocuments({ post: postId }),
       ]);
-
-      const totalLikes = voteDoc?.votes?.length || 0;
-      const totalComments = commentCount || 0;
-
-      // لگاریتم طبیعی برای جلوگیری از سلطه پست‌های پربازدید
-      const logLikes = Math.log1p(totalLikes);
-      const logComments = Math.log1p(totalComments);
-
-      return Math.min((logLikes + logComments) / 10, 1.0);
+      return Math.min((Math.log1p(voteDoc?.votes?.length || 0) + Math.log1p(commentCount || 0)) / 10, 1.0);
     } catch (err) {
       return 0;
     }
   }
 
   // ==========================================================
-  // ۳.۷ رتبه‌بندی Feed (مهم‌ترین تابع)
+  // ۳.۷ رتبه‌بندی Feed (الگوریتم صفحه اصلی)
   // ==========================================================
-  /**
-   * رتبه‌بندی پست‌های فید بر اساس ۵ سیگنال اصلی:
-   * Relationship, Interest, Recency, Engagement Velocity, Content Quality
-   * برگرفته از: Instagram Feed Algorithm 2025[reference:25]
-   */
   async rankFeedPosts(userId, posts, limit = 30) {
     const scoredPosts = [];
 
-    for (const post of posts) {
-      try {
-        const authorId = post.author?._id || post.author;
+    const results = await Promise.allSettled(
+      posts.map(async (post) => {
+        try {
+          const authorId = post.author?._id || post.author;
+          if (!authorId) return { post, score: 0 };
 
-        // محاسبه موازی سیگنال‌ها
-        const [relationship, interest, velocity, quality] = await Promise.all([
-          this.calculateRelationshipScore(userId, authorId),
-          this.calculateInterestScore(userId, post),
-          this.calculateEngagementVelocity(post._id),
-          this.calculateContentQuality(post._id),
-        ]);
+          const [relationship, interest, velocity, quality] = await Promise.all([
+            this.calculateRelationshipScore(userId, authorId),
+            this.calculateInterestScore(userId, post),
+            this.calculateEngagementVelocity(post._id),
+            this.calculateContentQuality(post._id),
+          ]);
 
-        // امتیاز تازگی
-        const ageHours = (Date.now() - new Date(post.createdAt || post.date).getTime()) / (1000 * 60 * 60);
-        const recency = Math.exp(-RECENCY_DECAY_FACTOR * ageHours / 24);
+          const ageHours = (Date.now() - new Date(post.createdAt).getTime()) / (1000 * 60 * 60);
+          const recency = Math.exp(-RECENCY_DECAY_FACTOR * ageHours / 24);
 
-        // محاسبه امتیاز نهایی با وزن‌های Instagram
-        const finalScore = (
-          relationship * SIGNAL_WEIGHTS.FEED_RELATIONSHIP +
-          interest * SIGNAL_WEIGHTS.FEED_INTEREST +
-          recency * SIGNAL_WEIGHTS.FEED_RECENCY +
-          velocity * SIGNAL_WEIGHTS.FEED_ENGAGEMENT_VELOCITY +
-          quality * SIGNAL_WEIGHTS.FEED_CONTENT_QUALITY
-        );
+          const finalScore = relationship * SIGNAL_WEIGHTS.FEED_RELATIONSHIP
+            + interest * SIGNAL_WEIGHTS.FEED_INTEREST
+            + recency * SIGNAL_WEIGHTS.FEED_RECENCY
+            + velocity * SIGNAL_WEIGHTS.FEED_ENGAGEMENT_VELOCITY
+            + quality * SIGNAL_WEIGHTS.FEED_CONTENT_QUALITY;
 
-        scoredPosts.push({
-          post,
-          score: finalScore,
-          signals: { relationship, interest, recency, velocity, quality },
-        });
-      } catch (err) {
-        scoredPosts.push({ post, score: 0 });
-      }
-    }
+          return { post, score: finalScore };
+        } catch {
+          return { post, score: 0 };
+        }
+      })
+    );
 
-    // مرتب‌سازی نزولی و محدود کردن
-    return scoredPosts
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit)
-      .map(item => item.post);
+    results.forEach(r => {
+      if (r.status === 'fulfilled') scoredPosts.push(r.value);
+    });
+
+    return scoredPosts.sort((a, b) => b.score - a.score).slice(0, limit).map(i => i.post);
   }
 
   // ==========================================================
   // ۳.۸ رتبه‌بندی Explore
   // ==========================================================
-  /**
-   * رتبه‌بندی صفحه Explore بر اساس:
-   * Popularity, Interest Match, Engagement Depth, Content Freshness
-   * برگرفته از: Instagram Explore Algorithm[reference:26]
-   */
   async rankExplorePosts(userId, posts, limit = 30) {
     const scoredPosts = [];
 
-    for (const post of posts) {
-      try {
-        const [popularity, interest, depth, velocity] = await Promise.all([
-          this.calculatePopularityScore(post._id),
-          this.calculateInterestScore(userId, post),
-          this.calculateEngagementDepth(post._id),
-          this.calculateEngagementVelocity(post._id),
-        ]);
+    const results = await Promise.allSettled(
+      posts.map(async (post) => {
+        try {
+          const [popularity, interest, depth, velocity] = await Promise.all([
+            this.calculatePopularityScore(post._id),
+            this.calculateInterestScore(userId, post),
+            this.calculateEngagementDepth(post._id),
+            this.calculateEngagementVelocity(post._id),
+          ]);
 
-        const ageHours = (Date.now() - new Date(post.createdAt || post.date).getTime()) / (1000 * 60 * 60);
-        const freshness = Math.exp(-RECENCY_DECAY_FACTOR * ageHours / 48); // decay کندتر برای Explore
+          const ageHours = (Date.now() - new Date(post.createdAt).getTime()) / (1000 * 60 * 60);
+          const freshness = Math.exp(-RECENCY_DECAY_FACTOR * ageHours / 48);
 
-        const finalScore = (
-          popularity * SIGNAL_WEIGHTS.EXPLORE_POPULARITY +
-          interest * SIGNAL_WEIGHTS.EXPLORE_INTEREST_MATCH +
-          depth * SIGNAL_WEIGHTS.EXPLORE_ENGAGEMENT_DEPTH +
-          freshness * SIGNAL_WEIGHTS.EXPLORE_CONTENT_FRESHNESS
-        );
+          const finalScore = popularity * SIGNAL_WEIGHTS.EXPLORE_POPULARITY
+            + interest * SIGNAL_WEIGHTS.EXPLORE_INTEREST_MATCH
+            + depth * SIGNAL_WEIGHTS.EXPLORE_ENGAGEMENT_DEPTH
+            + freshness * SIGNAL_WEIGHTS.EXPLORE_CONTENT_FRESHNESS;
 
-        scoredPosts.push({ post, score: finalScore });
-      } catch (err) {
-        scoredPosts.push({ post, score: 0 });
-      }
-    }
+          return { post, score: finalScore };
+        } catch {
+          return { post, score: 0 };
+        }
+      })
+    );
 
-    return scoredPosts
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit)
-      .map(item => item.post);
+    results.forEach(r => { if (r.status === 'fulfilled') scoredPosts.push(r.value); });
+    return scoredPosts.sort((a, b) => b.score - a.score).slice(0, limit).map(i => i.post);
   }
 
   // ==========================================================
   // ۳.۹ رتبه‌بندی Reels
   // ==========================================================
-  /**
-   * رتبه‌بندی Reels بر اساس Watch Time (مهم‌ترین)، Sends، Likes
-   * برگرفته از: Instagram Reels Algorithm 2025[reference:27]
-   */
   async rankReels(userId, reels, limit = 20) {
     const scoredReels = [];
 
@@ -423,121 +302,75 @@ class RankingEngine {
           this.calculateRelationshipScore(userId, authorId),
           this.calculatePopularityScore(reel._id),
         ]);
-
-        // امتیاز watch time (از داده‌های موجود)
         const watchTimeScore = Math.min((reel.duration || 10) / 60, 1.0);
-
-        // امتیاز sends (با استفاده از engagement depth به عنوان proxy)
         const sendsScore = await this.calculateEngagementDepth(reel._id);
-
-        // امتیاز likes
         const likesScore = Math.min((reel.likes?.length || 0) / 100, 1.0);
-
-        // امتیاز retention (با فرض ۷۰٪ برای reels با duration کوتاه)
         const retentionScore = Math.min((reel.duration || 10) <= 15 ? 0.8 : 0.5, 1.0);
-
         const ageHours = (Date.now() - new Date(reel.createdAt).getTime()) / (1000 * 60 * 60);
         const recency = Math.exp(-RECENCY_DECAY_FACTOR * ageHours / 24);
 
-        const finalScore = (
-          watchTimeScore * SIGNAL_WEIGHTS.REELS_WATCH_TIME +
-          sendsScore * SIGNAL_WEIGHTS.REELS_SENDS +
-          likesScore * SIGNAL_WEIGHTS.REELS_LIKES +
-          retentionScore * SIGNAL_WEIGHTS.REELS_RETENTION +
-          recency * SIGNAL_WEIGHTS.REELS_RECENCY +
-          relationship * 0.05 // relationship وزن کمتری در Reels دارد
-        );
-
-        scoredReels.push({ reel, score: finalScore });
-      } catch (err) {
+        const score = watchTimeScore * SIGNAL_WEIGHTS.REELS_WATCH_TIME
+          + sendsScore * SIGNAL_WEIGHTS.REELS_SENDS
+          + likesScore * SIGNAL_WEIGHTS.REELS_LIKES
+          + retentionScore * SIGNAL_WEIGHTS.REELS_RETENTION
+          + recency * SIGNAL_WEIGHTS.REELS_RECENCY
+          + relationship * 0.05;
+        scoredReels.push({ reel, score });
+      } catch {
         scoredReels.push({ reel, score: 0 });
       }
     }
-
-    return scoredReels
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit)
-      .map(item => item.reel);
+    return scoredReels.sort((a, b) => b.score - a.score).slice(0, limit).map(i => i.reel);
   }
 
   // ==========================================================
   // ۳.۱۰ رتبه‌بندی Stories
   // ==========================================================
-  /**
-   * رتبه‌بندی استوری‌ها بر اساس:
-   * Viewing History, Closeness, Recency, Engagement
-   * برگرفته از: Instagram Story Algorithm[reference:28]
-   */
   async rankStories(userId, stories, limit = 50) {
     const scoredStories = [];
-
     for (const story of stories) {
       try {
         const authorId = story.author?._id || story.author;
-
-        // ۱. سابقه مشاهده - کاربر چند بار استوری‌های این author را دیده
-        const viewingHistoryScore = story.viewers?.some(
-          v => v.user?.toString() === userId.toString()
-        ) ? 0.8 : 0.2;
-
-        // ۲. نزدیکی رابطه
+        const viewingHistoryScore = story.viewers?.some(v => v.user?.toString() === userId.toString()) ? 0.8 : 0.2;
         const closeness = await this.calculateRelationshipScore(userId, authorId);
-
-        // ۳. تازگی
         const ageHours = (Date.now() - new Date(story.createdAt).getTime()) / (1000 * 60 * 60);
-        const recency = Math.exp(-RECENCY_DECAY_FACTOR * ageHours / 6); // decay سریع‌تر (عمر ۲۴ ساعته)
-
-        // ۴. تعامل (پاسخ به استوری)
+        const recency = Math.exp(-RECENCY_DECAY_FACTOR * ageHours / 6);
         const engagementScore = Math.min((story.likes?.length || 0) / 5, 1.0);
 
-        const finalScore = (
-          viewingHistoryScore * SIGNAL_WEIGHTS.STORY_VIEWING_HISTORY +
-          closeness * SIGNAL_WEIGHTS.STORY_CLOSENESS +
-          recency * SIGNAL_WEIGHTS.STORY_RECENCY +
-          engagementScore * SIGNAL_WEIGHTS.STORY_ENGAGEMENT
-        );
-
-        scoredStories.push({ story, score: finalScore });
-      } catch (err) {
+        const score = viewingHistoryScore * SIGNAL_WEIGHTS.STORY_VIEWING_HISTORY
+          + closeness * SIGNAL_WEIGHTS.STORY_CLOSENESS
+          + recency * SIGNAL_WEIGHTS.STORY_RECENCY
+          + engagementScore * SIGNAL_WEIGHTS.STORY_ENGAGEMENT;
+        scoredStories.push({ story, score });
+      } catch {
         scoredStories.push({ story, score: 0 });
       }
     }
-
-    return scoredStories
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit)
-      .map(item => item.story);
+    return scoredStories.sort((a, b) => b.score - a.score).slice(0, limit).map(i => i.story);
   }
 
   // ==========================================================
-  // ۳.۱۱ پیشنهاد کاربر (User Suggestion)
+  // ۳.۱۱ پیشنهاد کاربران
   // ==========================================================
-  /**
-   * پیشنهاد کاربران برای دنبال کردن بر اساس:
-   * - کاربران مشترک دنبال‌شده
-   * - کاربرانی که توسط دنبال‌شونده‌های شما دنبال می‌شوند
-   * - شباهت در تعامل با محتوا
-   */
   async suggestUsers(userId, limit = 20) {
     try {
       const uid = ObjectId(userId);
       const followingDoc = await Following.findOne({ user: uid }).lean();
       const followingIds = followingDoc?.following?.map(f => f.user) || [];
 
-      // کاربرانی که توسط دنبال‌شونده‌های من دنبال می‌شوند (friends of friends)
-      const fofUsers = await Followers.aggregate([
-        { $match: { user: { $in: followingIds } } },
-        { $unwind: '$followers' },
-        { $group: { _id: '$followers.user', count: { $sum: 1 } } },
-        { $match: { _id: { $nin: [...followingIds, uid] } } },
-        { $sort: { count: -1 } },
-        { $limit: limit * 2 },
+      const [fofUsers, myPosts] = await Promise.all([
+        Followers.aggregate([
+          { $match: { user: { $in: followingIds } } },
+          { $unwind: '$followers' },
+          { $group: { _id: '$followers.user', count: { $sum: 1 } } },
+          { $match: { _id: { $nin: [...followingIds, uid] } } },
+          { $sort: { count: -1 } },
+          { $limit: limit * 2 },
+        ]),
+        Post.find({ author: uid }).select('hashtags').lean(),
       ]);
 
-      // کاربران با هشتگ‌های مشابه
-      const myPosts = await Post.find({ author: uid }).select('hashtags').lean();
       const myHashtags = [...new Set(myPosts.flatMap(p => p.hashtags || []))];
-
       const similarUsers = myHashtags.length > 0 ? await Post.aggregate([
         { $match: { hashtags: { $in: myHashtags }, author: { $ne: uid } } },
         { $group: { _id: '$author', count: { $sum: 1 } } },
@@ -546,31 +379,24 @@ class RankingEngine {
         { $limit: limit },
       ]) : [];
 
-      // ترکیب نتایج
       const suggestedIds = new Set();
       const suggestions = [];
-
       for (const fof of fofUsers) {
         if (!suggestedIds.has(fof._id.toString())) {
           suggestedIds.add(fof._id.toString());
-          suggestions.push({ userId: fof._id, score: fof.count, reason: 'followed_by_friends' });
+          suggestions.push({ userId: fof._id, score: fof.count });
         }
       }
-
       for (const su of similarUsers) {
         if (!suggestedIds.has(su._id.toString())) {
           suggestedIds.add(su._id.toString());
-          suggestions.push({ userId: su._id, score: su.count, reason: 'similar_interests' });
+          suggestions.push({ userId: su._id, score: su.count });
         }
       }
 
-      // دریافت اطلاعات کاربران
-      const suggestedUserIds = suggestions.slice(0, limit).map(s => s.userId);
-      const users = await User.find({ _id: { $in: suggestedUserIds } })
+      return await User.find({ _id: { $in: suggestions.slice(0, limit).map(s => s.userId) } })
         .select('username avatar fullName')
         .lean();
-
-      return users;
     } catch (err) {
       console.error('[SuggestUsers] Error:', err.message);
       return [];
@@ -578,8 +404,4 @@ class RankingEngine {
   }
 }
 
-// ============================================================
-// بخش ۴: صادرات نمونه Singleton
-// ============================================================
-const rankingEngine = new RankingEngine();
-module.exports = rankingEngine;
+module.exports = new RankingEngine();
