@@ -1,117 +1,145 @@
 // مسیر فایل: /handlers/socketHandler.js
-// توضیح: مدیریت ارسال اعلان‌ها و به‌روزرسانی‌های بلادرنگ با Socket.io.
-// این ماژول توابعی را برای ارسال نوتیفیکیشن، پست جدید و حذف پست به کاربران هدف ارائه می‌دهد.
+// توضیح: مدیریت ارتباط بلادرنگ با Socket.io. این ماژول توابع کمکی برای
+// ارسال انواع رویدادها (نوتیفیکیشن، پست جدید، حذف پست، پیام چت،
+// وضعیت تایپینگ و …) به کاربران هدف ارائه می‌دهد. از ثابت‌های رویداد
+// برای جلوگیری از خطاهای تایپی و افزایش خوانایی استفاده می‌کند.
+//
+// @version 2.5.0
+// @since 2026
 
 // ============================================================
 // بخش ۱: ثابت‌های رویدادها (Event Constants)
 // ============================================================
-// استفاده از ثابت‌ها برای نام رویدادها از بروز خطاهای تایپی جلوگیری می‌کند
-// و مدیریت آن‌ها را در کل برنامه ساده‌تر می‌سازد.
 const EVENTS = {
-  NEW_NOTIFICATION: 'newNotification',
-  NEW_POST: 'newPost',
-  DELETE_POST: 'deletePost',
+  NEW_NOTIFICATION: 'newNotification',   // نوتیفیکیشن جدید
+  NEW_POST: 'newPost',                   // پست جدید در فید
+  DELETE_POST: 'deletePost',             // حذف یک پست
+  NEW_MESSAGE: 'newMessage',             // پیام جدید در چت
+  TYPING: 'typing',                      // کاربر در حال تایپ
+  STOP_TYPING: 'stopTyping',             // تایپ متوقف شد
+  USER_ONLINE: 'userOnline',             // کاربر آنلاین شد
+  USER_OFFLINE: 'userOffline',           // کاربر آفلاین شد
 };
 
 // ============================================================
-// بخش ۲: تابع کمکی برای استخراج ایمن نمونه Socket.io
+// بخش ۲: تابع کمکی برای دریافت ایمن نمونه Socket.io
 // ============================================================
-
-/**
- * @function getIO
- * @description دریافت نمونه Socket.io از شیء req و بررسی وجود آن
- * @param {object} req - شیء درخواست Express
- * @returns {object|null} - نمونه Socket.io یا null در صورت عدم وجود
- */
 const getIO = (req) => {
   try {
     const io = req.app.get('socketio');
     if (!io) {
-      console.error('[SocketHandler] Socket.io instance is not available on req.app');
+      console.warn('[SocketHandler] Socket.io instance not available on req.app');
       return null;
     }
     return io;
   } catch (error) {
-    console.error('[SocketHandler] Error accessing Socket.io instance:', error.message);
+    console.error('[SocketHandler] Error accessing Socket.io:', error.message);
     return null;
   }
 };
 
 // ============================================================
-// بخش ۳: تابع‌های اصلی ارسال پیام
+// بخش ۳: توابع اصلی ارسال رویدادها
 // ============================================================
 
 /**
- * @function sendNotification
- * @description ارسال یک نوتیفیکیشن بلادرنگ به کاربر گیرنده
- * @param {object} req - شیء درخواست Express برای دسترسی به io
- * @param {object} notification - شیء نوتیفیکیشن شامل type, sender, receiver و ...
+ * ارسال نوتیفیکیشن بلادرنگ به کاربر
+ * @param {object} req - شیء درخواست Express
+ * @param {object} notification - شیء نوتیفیکیشن با فیلدهای ضروری receiver, type و غیره
  */
 module.exports.sendNotification = (req, notification) => {
   const io = getIO(req);
-  if (!io) return; // خروج ایمن در صورت نبودن io
+  if (!io) return;
 
-  // اعتبارسنجی اولیه داده‌های نوتیفیکیشن
-  if (!notification || !notification.receiver) {
-    console.warn('[SocketHandler] Invalid notification object, skipping emit.');
+  if (!notification?.receiver) {
+    console.warn('[SocketHandler] Invalid notification (missing receiver)');
     return;
   }
 
-  // ارسال رویداد به روم اختصاصی کاربر (شناسه کاربر به عنوان نام روم)
   io.to(notification.receiver.toString()).emit(EVENTS.NEW_NOTIFICATION, notification);
-  console.log(`[SocketHandler] Notification sent to user ${notification.receiver}`, {
-    type: notification.notificationType,
-    sender: notification.sender?._id || notification.sender,
-  });
+  console.log(`[SocketHandler] Notification sent to ${notification.receiver}`);
 };
 
 /**
- * @function sendPost
- * @description اطلاع‌رسانی به یک کاربر از ایجاد پست جدید (مثلاً در فید یا ارسال به دنبال‌کنندگان)
- * @param {object} req - شیء درخواست Express
- * @param {object} post - شیء پست جدید
- * @param {string|string[]} receiver - شناسه کاربر(های) گیرنده
+ * اطلاع‌رسانی پست جدید به کاربر(ان)
+ * @param {object} req
+ * @param {object} post - داده‌های پست
+ * @param {string|string[]} receiver - شناسه کاربر یا آرایه‌ای از کاربران
  */
 module.exports.sendPost = (req, post, receiver) => {
   const io = getIO(req);
-  if (!io) return;
+  if (!io || !post || !receiver) return;
 
-  if (!post || !receiver) {
-    console.warn('[SocketHandler] Invalid post data or receiver, skipping emit.');
-    return;
-  }
-
-  // امکان ارسال به چند کاربر به صورت آرایه
   const receivers = Array.isArray(receiver) ? receiver : [receiver];
-  receivers.forEach((userId) => {
-    if (userId) {
-      io.to(userId.toString()).emit(EVENTS.NEW_POST, post);
-      console.log(`[SocketHandler] New post sent to user ${userId}`);
+  receivers.forEach((uid) => {
+    if (uid) {
+      io.to(uid.toString()).emit(EVENTS.NEW_POST, post);
     }
   });
 };
 
 /**
- * @function deletePost
- * @description اطلاع‌رسانی به کاربر(ان) از حذف یک پست
- * @param {object} req - شیء درخواست Express
+ * اطلاع‌رسانی حذف پست به کاربر(ان)
+ * @param {object} req
  * @param {string} postId - شناسه پست حذف‌شده
- * @param {string|string[]} receiver - شناسه کاربر(های) گیرنده
+ * @param {string|string[]} receiver
  */
 module.exports.deletePost = (req, postId, receiver) => {
   const io = getIO(req);
-  if (!io) return;
-
-  if (!postId || !receiver) {
-    console.warn('[SocketHandler] Invalid postId or receiver, skipping emit.');
-    return;
-  }
+  if (!io || !postId || !receiver) return;
 
   const receivers = Array.isArray(receiver) ? receiver : [receiver];
-  receivers.forEach((userId) => {
-    if (userId) {
-      io.to(userId.toString()).emit(EVENTS.DELETE_POST, postId);
-      console.log(`[SocketHandler] Post deletion (${postId}) sent to user ${userId}`);
+  receivers.forEach((uid) => {
+    if (uid) {
+      io.to(uid.toString()).emit(EVENTS.DELETE_POST, postId);
     }
   });
 };
+
+/**
+ * ارسال پیام جدید چت به کاربر گیرنده
+ * @param {object} req
+ * @param {object} message - شیء کامل پیام
+ * @param {string} receiverId - شناسه کاربر گیرنده
+ */
+module.exports.sendMessage = (req, message, receiverId) => {
+  const io = getIO(req);
+  if (!io || !message || !receiverId) return;
+
+  io.to(receiverId.toString()).emit(EVENTS.NEW_MESSAGE, message);
+};
+
+/**
+ * ارسال وضعیت تایپینگ
+ * @param {object} req
+ * @param {string} conversationId - شناسه مکالمه
+ * @param {string} senderId - کاربری که تایپ می‌کند
+ * @param {boolean} isTyping - شروع یا توقف تایپ
+ */
+module.exports.sendTypingStatus = (req, conversationId, senderId, isTyping = true) => {
+  const io = getIO(req);
+  if (!io || !conversationId) return;
+
+  const event = isTyping ? EVENTS.TYPING : EVENTS.STOP_TYPING;
+  // ارسال به کل روم مکالمه (همه اعضا)
+  io.to(conversationId).emit(event, {
+    conversationId,
+    userId: senderId,
+  });
+};
+
+/**
+ * اطلاع‌رسانی آنلاین/آفلاین شدن کاربر (می‌توان در connection/disconnect استفاده کرد)
+ * @param {object} io - نمونه Socket.io
+ * @param {string} userId - کاربر هدف
+ * @param {boolean} online
+ */
+module.exports.notifyOnlineStatus = (io, userId, online = true) => {
+  if (!io || !userId) return;
+  const event = online ? EVENTS.USER_ONLINE : EVENTS.USER_OFFLINE;
+  // معمولاً به همه کاربران (broadcast) یا به لیست دوستان ارسال می‌شود
+  // در اینجا به‌عنوان مثال به همه ارسال می‌کنیم
+  io.emit(event, { userId, online });
+};
+
+module.exports.EVENTS = EVENTS; // صادرات ثابت‌ها برای استفاده در سایر ماژول‌ها
