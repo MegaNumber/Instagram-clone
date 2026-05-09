@@ -1,12 +1,20 @@
 # مسیر فایل: /docker-compose.yml
-# توضیح: فایل Docker Compose برای راه‌اندازی بک‌اند و پایگاه داده MongoDB
-# به همراه شبکه و Volume اختصاصی. مناسب برای توسعه و تولید.
+# توضیح: فایل Docker Compose برای اجرای کامل سرویس‌های بک‌اند Instaclone.
+# شامل MongoDB (پایگاه داده)، Redis (کش و محدودیت نرخ) و خود سرور Node.js.
+# تمام سرویس‌ها در یک شبکهٔ اختصاصی قرار دارند و داده‌ها از طریق Volume
+# ماندگار می‌شوند. مناسب برای محیط توسعه و تولید.
+#
+# نحوهٔ اجرا:
+#   docker-compose up -d
+#
+# @version 2.5.0
+# @since 2026
 
 version: '3.8'
 
 services:
   # ======================================
-  # سرویس پایگاه داده MongoDB
+  # ۱. پایگاه داده MongoDB
   # ======================================
   mongo:
     image: mongo:6.0
@@ -15,15 +23,38 @@ services:
     environment:
       MONGO_INITDB_DATABASE: instaclone
     volumes:
-      - mongo-data:/data/db
+      - mongo-data:/data/db            # ماندگاری داده‌های پایگاه داده
     networks:
       - instaclone-network
-    # (اختیاری) اگر می‌خواهید از خارج به MongoDB دسترسی داشته باشید:
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # در صورت نیاز به دسترسی مستقیم از بیرون (اختیاری):
     # ports:
     #   - "27017:27017"
 
   # ======================================
-  # سرویس بک‌اند (Node.js)
+  # ۲. سرویس کش Redis
+  # ======================================
+  redis:
+    image: redis:7-alpine
+    container_name: instaclone-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data               # ماندگاری داده‌های کش
+    networks:
+      - instaclone-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ======================================
+  # ۳. سرویس بک‌اند (Node.js + Express)
   # ======================================
   backend:
     build:
@@ -32,34 +63,46 @@ services:
     container_name: instaclone-backend
     restart: unless-stopped
     ports:
-      - "5000:5000"
+      - "${PORT:-5000}:5000"            # پورت قابل تنظیم از طریق متغیر محیطی
     env_file:
-      - .env
+      - .env                            # بارگذاری تمام متغیرهای محیطی از فایل .env
     environment:
       - NODE_ENV=production
       - MONGO_URI=mongodb://mongo:27017/instaclone
+      - REDIS_URL=redis://redis:6379
+      - REDIS_ENABLED=true
       - PORT=5000
     depends_on:
-      - mongo
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
       - instaclone-network
     volumes:
-      # برای توسعه می‌توانید کد را mount کنید (اختیاری)
-      # - ./:/usr/src/app
-      # - /usr/src/app/node_modules
-      # برای ذخیره دائمی فایل‌های آپلودشده
+      # ماندگاری فایل‌های آپلودشده (تصاویر، ویدئوها و ...)
       - uploads-data:/usr/src/app/public/uploads
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:5000/api/health', r => {process.exit(r.statusCode === 200 ? 0 : 1)})"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 # ======================================
-# تعریف Volume ها
+# تعریف Volume های نام‌گذاری‌شده
 # ======================================
 volumes:
   mongo-data:
+    name: instaclone-mongo-data
+  redis-data:
+    name: instaclone-redis-data
   uploads-data:
+    name: instaclone-uploads-data
 
 # ======================================
-# تعریف شبکه
+# تعریف شبکهٔ اختصاصی
 # ======================================
 networks:
   instaclone-network:
+    name: instaclone-network
     driver: bridge
