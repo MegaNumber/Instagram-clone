@@ -1,2 +1,49 @@
+# ============================================================
+# فایل: .dockerignore
+# توضیح: فهرست فایل‌ها و پوشه‌هایی که نباید هنگام ساخت ایمیج داکر
+#         کپی شوند (بهینه‌سازی حجم و امنیت).
+# ============================================================
+
+# ---------- ۱. وابستگی‌ها (در زمان build نصب می‌شوند) ----------
 node_modules
-./client/node_modules
+/client/node_modules
+
+# ---------- ۲. فایل‌های محیطی و امنیتی ----------
+.env
+.env.local
+.env.production
+
+# ---------- ۳. فایل‌های آپلودشده (در Volume نگهداری می‌شوند) ----------
+public/uploads/*
+!public/uploads/.gitkeep
+
+# ---------- ۴. لاگ‌ها ----------
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# ---------- ۵. پوشه‌های تولید (build) ----------
+/client/build
+/dist
+/build
+
+# ---------- ۶. فایل‌های سیستمی ----------
+.DS_Store
+Thumbs.db
+
+# ---------- ۷. گیت ----------
+.git
+.gitignore
+.gitattributes
+
+# ---------- ۸. داکر ----------
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# ---------- ۹. مستندات و ابزارهای توسعه ----------
+README.md
+screenshots
+test
+tests
