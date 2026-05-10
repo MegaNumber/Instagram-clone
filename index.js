@@ -1,25 +1,14 @@
 // مسیر فایل: /index.js
 // توضیح: نقطهٔ ورود اصلی سرور Express. این فایل مسئول پیکربندی و راه‌اندازی
 // تمام میان‌افزارهای سراسری (امنیتی، عملکردی، لاگ‌گیری)، اتصال به MongoDB،
-// فعال‌سازی Socket.io با احراز هویت JWT، و بارگذاری مسیرهای API است.
-// طراحی آن بر اساس آخرین متدهای امنیتی و معماری لایه‌ای انجام شده است.
-//
-// ویژگی‌های کلیدی:
-// - Helmet برای تنظیم هدرهای امنیتی
-// - CORS مدیریت‌شده
-// - Rate Limiting مبتنی بر Redis با استراتژی‌های مختلف
-// - Slow Down برای کاهش نرخ درخواست‌های بیش‌ازحد
-// - محافظت در برابر HPP و XSS
-// - تجزیهٔ کوکی‌ها
-// - فشرده‌سازی در محیط Production
-// - پشتیبانی از چندین مسیر API شامل Stories, Messages, Reels, Feed هوشمند و Reports
-// - مدیریت خطای ساختاریافته با پیام‌های فارسی
-// - ارتباط بلادرنگ با Socket.io و احراز هویت از طریق handshake token
-// - Graceful shutdown برای پایان ایمن پردازش‌ها
+// فعال‌سازی Socket.io با احراز هویت JWT، و بارگذاری یکپارچهٔ مسیرهای API است.
 //
 // @author Sandermoen & Contributors
-// @version 2.1.1
-// @since 2026
+// @version 2.2.0 (اصلاح حذف بارگذاری مضاعف مسیرهای stories, messages, reels, reports)
+//
+// [v2.2.0] تغییرات:
+// - حذف app.use اضافی برای stories, messages, reels, reports (اکنون فقط از apiRouter استفاده می‌شود)
+// - حفظ module.exports = app جهت تست‌های یکپارچگی
 
 // ============================================================
 // بخش ۱: بارگذاری متغیرهای محیطی
@@ -29,24 +18,24 @@ require('dotenv').config();
 // ============================================================
 // بخش ۲: ایمپورت کتابخانه‌های اصلی
 // ============================================================
-const express = require('express');
-const cors = require('cors');
-const helmet = require('helmet');
-const compression = require('compression');
+const express = require('express');               // express@4.x
+const cors = require('cors');                     // cors@2.x
+const helmet = require('helmet');                 // helmet@7.x
+const compression = require('compression');       // compression@1.x
 const path = require('path');
 const http = require('http');
-const socketio = require('socket.io');
-const mongoose = require('mongoose');
-const morgan = require('morgan');
-const cookieParser = require('cookie-parser');
-const hpp = require('hpp');
-const xss = require('xss-clean');
-const jwt = require('jsonwebtoken');
+const socketio = require('socket.io');            // socket.io@4.x
+const mongoose = require('mongoose');             // mongoose@7.x
+const morgan = require('morgan');                 // morgan@1.x
+const cookieParser = require('cookie-parser');    // cookie-parser@1.x
+const hpp = require('hpp');                       // hpp@0.x
+const xss = require('xss-clean');                 // xss-clean@0.x
+const jwt = require('jsonwebtoken');              // jsonwebtoken@9.x
 
 // ============================================================
 // بخش ۳: ایمپورت میان‌افزارهای سفارشی و مسیرها
 // ============================================================
-const apiRouter = require('./routes');
+const apiRouter = require('./routes');            // تجمیع همهٔ زیرمسیرها در یک Router
 const { globalLimiter, apiSlowDown } = require('./middleware/rateLimiter');
 
 // ============================================================
@@ -61,7 +50,6 @@ const PORT = process.env.PORT || 9000;
 
 // ۵.۱. تنظیم هدرهای امنیتی با Helmet
 app.use(helmet());
-// مخفی‌سازی هدر X-Powered-By برای کاهش اطلاعات افشاشده
 app.use(helmet.hidePoweredBy());
 
 // ۵.۲. فعال‌سازی CORS با کنترل دقیق Origin
@@ -70,11 +58,11 @@ app.use(
     origin: process.env.ALLOWED_ORIGINS
       ? process.env.ALLOWED_ORIGINS.split(',')
       : '*',
-    credentials: true, // ارسال کوکی‌ها
+    credentials: true,
   })
 );
 
-// ۵.۳. محافظت در برابر حملات آلودگی پارامترهای HTTP (HPP)
+// ۵.۳. محافظت در برابر آلودگی پارامترهای HTTP (HPP)
 app.use(hpp());
 
 // ۵.۴. پاک‌سازی ورودی‌ها از کدهای مخرب XSS
@@ -95,7 +83,7 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 // ============================================================
-// بخش ۸: اعتماد به پروکسی معکوس (ضروری برای دریافت IP واقعی)
+// بخش ۸: اعتماد به پروکسی معکوس (ضروری برای Rate Limiter)
 // ============================================================
 app.set('trust proxy', 1);
 
@@ -109,7 +97,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.use('/uploads', express.static(path.join(__dirname, 'public/uploads')));
 
 // ============================================================
-// بخش ۱۰: اعمال Rate Limiting و Slow Down
+// بخش ۱۰: اعمال Rate Limiting و Slow Down سراسری
 // ============================================================
 // ۱۰.۱. محدودیت نرخ عمومی با Redis Store
 app.use('/api', globalLimiter);
@@ -118,15 +106,13 @@ app.use('/api', globalLimiter);
 app.use('/api', apiSlowDown);
 
 // ============================================================
-// بخش ۱۱: مسیرهای API
+// بخش ۱۱: مسیرهای API (تجمیع‌شده)
 // ============================================================
+// تمام endpointها از طریق apiRouter ( routes/index.js ) مدیریت می‌شوند.
+// این شامل auth، users، posts، comments، notifications، stories،
+// messages، reels، feed هوشمند و reports می‌شود.
+// [v2.2.0] دیگر نیازی به app.use مجزا برای stories, messages, reels, reports نیست.
 app.use('/api', apiRouter);
-
-// اضافه کردن مسیرهای جدیدی که مستقیماً در اینجا بارگذاری می‌شوند
-app.use('/api/stories', require('./routes/story'));
-app.use('/api/messages', require('./routes/message'));
-app.use('/api/reels', require('./routes/reel'));
-app.use('/api/reports', require('./routes/report'));
 
 // ============================================================
 // بخش ۱۲: تنظیمات مخصوص محیط تولید
@@ -138,7 +124,7 @@ if (process.env.NODE_ENV === 'production') {
   // سرو فایل‌های ساخته‌شدهٔ React (فرانت‌اند)
   app.use(express.static(path.join(__dirname, 'client/build')));
 
-  // برای تمام مسیرهایی که با /api شروع نمی‌شوند، index.html ارسال شود
+  // برای تمام مسیرهای غیر API، فایل index.html فرانت‌اند ارسال شود
   app.get(/^\/(?!api).*/, (req, res) => {
     res.sendFile(path.join(__dirname, 'client/build', 'index.html'));
   });
@@ -210,7 +196,7 @@ io.use((socket, next) => {
   }
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    socket.user = decoded; // اطلاعات کاربر در socket ذخیره می‌شود
+    socket.user = decoded;
     return next();
   } catch (err) {
     return next(new Error('Authentication error: Invalid token'));
@@ -221,11 +207,10 @@ io.use((socket, next) => {
 // بخش ۱۷: مدیریت اتصالات Socket.io
 // ============================================================
 io.on('connection', (socket) => {
-  // هر کاربر به یک room اختصاصی با شناسهٔ خود ملحق می‌شود
   socket.join(socket.user.id);
   console.log(`🔗 Socket connected: user ${socket.user.id}, socket ${socket.id}`);
 
-  // در صورت نیاز، سایر رویدادها از فایل‌های جداگانه بارگذاری شوند
+  // بارگذاری مدیریت‌کننده‌های رویداد (در صورت نیاز)
   // require('./handlers/socketHandler')(socket, io);
 });
 
@@ -241,27 +226,24 @@ server.listen(PORT, () => {
 // ============================================================
 const gracefulShutdown = async (signal) => {
   console.log(`\n${signal} دریافت شد. خاموشی آرام آغاز می‌شود...`);
-  // بستن اتصال Mongoose
   await mongoose.connection.close(false);
   console.log('اتصال MongoDB بسته شد.');
-  // بستن socket.io
   io.close();
-  // خروج از پروسه
   process.exit(0);
 };
 
-// گوش دادن به سیگنال‌های سیستم
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // ============================================================
-// بخش ۲۰: مدیریت rejectionهای سراسری (Unhandled Rejection)
+// بخش ۲۰: مدیریت rejectionهای سراسری
 // ============================================================
 process.on('unhandledRejection', (reason, promise) => {
   console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
-  // در محیط Production ممکن است نخواهیم که پروسه کرش کند،
-  // اما حداقل باید لاگ شود. در اینجا به‌دلیل اهمیت، برنامه را متوقف می‌کنیم.
   process.exit(1);
 });
 
-module.exports = app; // برای تست‌های احتمالی
+// ============================================================
+// بخش ۲۱: صادرات app برای تست‌های یکپارچگی
+// ============================================================
+module.exports = app;
