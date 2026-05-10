@@ -3,8 +3,9 @@
 // و بازیابی پست‌ها. از سرویس ذخیره‌سازی یکپارچه، کش Redis، و پردازش
 // تصویر با sharp استفاده می‌کند.
 //
-// @version 2.5.0
-// @since 2026
+// [v2.6.0] تغییرات:
+// - رأی‌دهی به پست اکنون در یک تراکنش MongoDB انجام می‌شود (atomic vote + notification)
+// - استفاده از transactionHelper برای مدیریت commit/rollback
 
 // ============================================================
 // بخش ۱: ایمپورت‌ها
@@ -26,6 +27,7 @@ const storageService = require('../utils/storage');
 const { saveUploadedFile } = require('../utils/fileUpload');
 const { retrieveComments, populatePostsPipeline } = require('../utils/controllerUtils');
 const filters = require('../utils/filters');
+const runTransaction = require('../utils/transactionHelper'); // [v2.6.0] جدید
 
 // ============================================================
 // بخش ۲: توابع کمکی
@@ -33,8 +35,6 @@ const filters = require('../utils/filters');
 
 /**
  * استخراج هشتگ‌ها از متن
- * @param {string} caption
- * @returns {string[]}
  */
 const extractHashtags = (caption) => {
   if (!caption) return [];
@@ -85,7 +85,7 @@ module.exports.createPost = asyncHandler(async (req, res) => {
   // ایجاد سند رأی برای پست
   await PostVote.create({ post: post._id });
 
-  // پاک‌سازی کش فید کاربر (اختیاری)
+  // پاک‌سازی کش فید کاربر
   await redisCache.delByPattern(`feed:${user._id}:*`);
 
   res.status(201).json({
@@ -173,7 +173,7 @@ module.exports.retrievePost = asyncHandler(async (req, res) => {
 });
 
 // ============================================================
-// بخش ۶: رأی‌دهی (لایک/دیسلایک)
+// بخش ۶: رأی‌دهی (لایک/دیسلایک) – [v2.6.0] تراکنشی شد
 // ============================================================
 module.exports.votePost = asyncHandler(async (req, res) => {
   const { postId } = req.params;
@@ -184,23 +184,61 @@ module.exports.votePost = asyncHandler(async (req, res) => {
     return res.status(404).json({ success: false, error: 'پستی با این شناسه یافت نشد.' });
   }
 
-  const result = await PostVote.toggleVote(postId, user._id);
+  // استفاده از تراکنش برای اتمیک بودن تغییر رأی + نوتیفیکیشن
+  const result = await runTransaction(async (session) => {
+    // ۱. یافتن سند رأی پست
+    let voteDoc = await PostVote.findOne({ post: postId }).session(session);
+    if (!voteDoc) {
+      // اگر به هر دلیلی سند وجود نداشت (مثلاً حذف شده باشد)، ایجاد کن
+      voteDoc = new PostVote({ post: postId, votes: [] });
+    }
 
-  // نوتیفیکیشن در صورت لایک
-  if (result === 'added' && String(post.author) !== String(user._id)) {
-    const notification = await Notification.create({
-      notificationType: 'like',
-      sender: user._id,
-      receiver: post.author,
-      notificationData: {
-        postId,
-        image: post.thumbnail || post.image,
-        filter: post.filter,
-      },
-    });
+    // ۲. تعیین عملیات (like/unlike)
+    const existingVote = voteDoc.votes.find(
+      (v) => v.user.toString() === user._id.toString()
+    );
+    let operation; // 'added' | 'removed'
 
+    if (existingVote) {
+      // حذف رأی (unlike)
+      voteDoc.votes.pull({ user: user._id });
+      operation = 'removed';
+    } else {
+      // افزودن رأی (like)
+      voteDoc.votes.push({ user: user._id });
+      operation = 'added';
+    }
+
+    await voteDoc.save({ session });
+
+    // ۳. ایجاد نوتیفیکیشن فقط در حالت like و برای پست دیگران
+    let notification = null;
+    if (operation === 'added' && String(post.author) !== String(user._id)) {
+      notification = await Notification.create(
+        [
+          {
+            notificationType: 'like',
+            sender: user._id,
+            receiver: post.author,
+            notificationData: {
+              postId,
+              image: post.thumbnail || post.image,
+              filter: post.filter,
+            },
+          },
+        ],
+        { session }
+      );
+      notification = notification[0]; // چون آرایه برمی‌گرداند
+    }
+
+    return { operation, notification };
+  });
+
+  // ارسال نوتیفیکیشن از طریق سوکت (بیرون از تراکنش تا در صورت خطای شبکه تأثیری نگذارد)
+  if (result.operation === 'added' && result.notification) {
     socketHandler.sendNotification(req, {
-      ...notification.toObject(),
+      ...result.notification.toObject(),
       sender: {
         _id: user._id,
         username: user.username,
@@ -209,11 +247,14 @@ module.exports.votePost = asyncHandler(async (req, res) => {
     });
   }
 
-  res.status(200).json({ success: true, operation: result === 'added' ? 'like' : 'unlike' });
+  res.status(200).json({
+    success: true,
+    operation: result.operation === 'added' ? 'like' : 'unlike',
+  });
 });
 
 // ============================================================
-// بخش ۷: فید پست‌ها (با Redis Cache)
+// بخش ۷: فید پست‌ها (با Redis Cache) – بدون تغییر
 // ============================================================
 module.exports.retrievePostFeed = asyncHandler(async (req, res) => {
   const user = res.locals.user;
@@ -221,12 +262,10 @@ module.exports.retrievePostFeed = asyncHandler(async (req, res) => {
   const cacheKey = `feed:${user._id}:${offset}`;
 
   const result = await redisCache.get(cacheKey, async () => {
-    // دریافت لیست دنبال‌شونده‌ها
     const followingDoc = await require('../models/Following').findOne({ user: user._id }).lean();
     const followingIds = followingDoc?.following?.map((f) => f.user) || [];
-    followingIds.push(user._id); // شامل خود کاربر
+    followingIds.push(user._id);
 
-    // بازیابی پست‌ها با aggregation
     const posts = await Post.aggregate([
       { $match: { author: { $in: followingIds.map((id) => ObjectId(id)) } } },
       { $sort: { createdAt: -1 } },
@@ -236,7 +275,7 @@ module.exports.retrievePostFeed = asyncHandler(async (req, res) => {
     ]);
 
     return posts;
-  }, 60); // TTL = ۶۰ ثانیه
+  }, 60);
 
   res.status(200).json({
     success: true,
@@ -246,7 +285,7 @@ module.exports.retrievePostFeed = asyncHandler(async (req, res) => {
 });
 
 // ============================================================
-// بخش ۸: پست‌های پیشنهادی (اکسپلور ساده)
+// بخش ۸: پست‌های پیشنهادی – بدون تغییر
 // ============================================================
 module.exports.retrieveSuggestedPosts = asyncHandler(async (req, res) => {
   const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
@@ -267,7 +306,7 @@ module.exports.retrieveSuggestedPosts = asyncHandler(async (req, res) => {
 });
 
 // ============================================================
-// بخش ۹: جستجوی پست بر اساس هشتگ
+// بخش ۹: جستجوی هشتگ – بدون تغییر
 // ============================================================
 module.exports.retrieveHashtagPosts = asyncHandler(async (req, res) => {
   const { hashtag } = req.params;
