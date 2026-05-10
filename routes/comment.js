@@ -2,12 +2,17 @@
 // توضیح: تعریف مسیرهای مربوط به نظرات و پاسخ‌ها. این فایل تمام endpointهای
 // ایجاد، حذف، رأی‌دهی و بازیابی نظرات و پاسخ‌های آن‌ها را به کنترلرهای
 // مربوطه نگاشت می‌کند و میدلورهای احراز هویت را اعمال می‌کند.
+//
+// [v2.0.0] اصلاحیه:
+// - افزودن validateObjectId برای تمام مسیرهای دارای پارامترهای شناسه
+//   (postId, commentId, parentCommentId, commentReplyId)
 
 // ============================================================
 // بخش ۱: ایمپورت وابستگی‌های اصلی
 // ============================================================
 const express = require('express');
 const commentRouter = express.Router();
+const mongoose = require('mongoose');                     // mongoose@7.x
 
 // ============================================================
 // بخش ۲: ایمپورت میدلورها و کنترلرها
@@ -27,7 +32,27 @@ const {
 } = require('../controllers/commentController');
 
 // ============================================================
-// بخش ۳: تعریف مسیرهای نظرات
+// بخش ۳: میدلور اعتبارسنجی شناسه‌های مونگو
+// ============================================================
+/**
+ * @middleware validateObjectId
+ * @description بررسی معتبر بودن شناسهٔ MongoDB. در صورت نامعتبر بودن،
+ * پاسخ ۴۰۰ با پیام خطای فارسی برگردانده می‌شود.
+ * @param {string} paramName - نام پارامتر (مثلاً postId, commentId)
+ */
+const validateObjectId = (paramName) => (req, res, next) => {
+  const id = req.params[paramName];
+  if (id && !mongoose.Types.ObjectId.isValid(id)) {
+    return res.status(400).json({
+      success: false,
+      error: `شناسه ${paramName} نامعتبر است.`,
+    });
+  }
+  next();
+};
+
+// ============================================================
+// بخش ۴: تعریف مسیرهای نظرات
 // ============================================================
 
 // ایجاد نظر جدید روی یک پست
@@ -35,6 +60,7 @@ const {
 commentRouter.post(
   '/:postId',
   requireAuth,
+  validateObjectId('postId'),           // [v2.0.0] افزوده شد
   asyncHandler(createComment)
 );
 
@@ -43,6 +69,7 @@ commentRouter.post(
 commentRouter.delete(
   '/:commentId',
   requireAuth,
+  validateObjectId('commentId'),        // [v2.0.0] افزوده شد
   asyncHandler(deleteComment)
 );
 
@@ -51,6 +78,7 @@ commentRouter.delete(
 commentRouter.post(
   '/:commentId/vote',
   requireAuth,
+  validateObjectId('commentId'),        // [v2.0.0] افزوده شد
   asyncHandler(voteComment)
 );
 
@@ -59,6 +87,7 @@ commentRouter.post(
 commentRouter.post(
   '/:parentCommentId/reply',
   requireAuth,
+  validateObjectId('parentCommentId'),  // [v2.0.0] افزوده شد
   asyncHandler(createCommentReply)
 );
 
@@ -67,6 +96,7 @@ commentRouter.post(
 commentRouter.delete(
   '/reply/:commentReplyId',
   requireAuth,
+  validateObjectId('commentReplyId'),   // [v2.0.0] افزوده شد
   asyncHandler(deleteCommentReply)
 );
 
@@ -75,6 +105,7 @@ commentRouter.delete(
 commentRouter.post(
   '/reply/:commentReplyId/vote',
   requireAuth,
+  validateObjectId('commentReplyId'),   // [v2.0.0] افزوده شد
   asyncHandler(voteCommentReply)
 );
 
@@ -82,6 +113,7 @@ commentRouter.post(
 // GET /api/comments/:parentCommentId/replies?offset=0
 commentRouter.get(
   '/:parentCommentId/replies',
+  validateObjectId('parentCommentId'),  // [v2.0.0] افزوده شد (بدون نیاز به احراز)
   asyncHandler(retrieveCommentReplies)
 );
 
@@ -89,10 +121,11 @@ commentRouter.get(
 // GET /api/comments/:postId?offset=0&exclude=0
 commentRouter.get(
   '/:postId',
+  validateObjectId('postId'),           // [v2.0.0] افزوده شد (بدون نیاز به احراز)
   asyncHandler(retrieveComments)
 );
 
 // ============================================================
-// بخش ۴: صادرات Router
+// بخش ۵: صادرات Router
 // ============================================================
 module.exports = commentRouter;
