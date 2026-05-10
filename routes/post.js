@@ -1,17 +1,19 @@
 // مسیر فایل: /routes/post.js
 // توضیح: تعریف مسیرهای مربوط به پست‌ها. این فایل endpointهای ایجاد، دریافت، رأی‌دهی،
-// حذف، فید، پست‌های پیشنهادی و جستجوی هشتگ را مدیریت می‌کند. شامل میدلورهای
-// احراز هویت، محدودیت نرخ، آپلود تصویر با Multer و اعتبارسنجی شناسه‌ها است.
+// حذف، فید، پست‌های پیشنهادی و جستجوی هشتگ را مدیریت می‌کند.
+//
+// [v2.0.0] اصلاحیه مهم:
+// - جایگزینی Multer با `uploadPostImage` از `utils/fileUpload.js` برای استفاده از `memoryStorage`
+//   (رفع ناسازگاری با `sharp` در کنترلر `createPost` که به `req.file.buffer` نیاز داشت)
+// - بازچینی مسیرها برای جلوگیری از تداخل مسیرهای ثابت (feed, suggested, filters) با `:postId`
 
 // ============================================================
-// بخش ۱: ایمپورت وابستگی‌های اصلی
+// بخش ۱: ایمپورت وابستگی‌های اصلی (نسخه‌ها در package.json)
 // ============================================================
-const express = require('express');
+const express = require('express');               // express@4.x
 const postRouter = express.Router();
-const multer = require('multer');
-const path = require('path');
-const rateLimit = require('express-rate-limit');
-const mongoose = require('mongoose');
+const rateLimit = require('express-rate-limit');   // express-rate-limit@7.x
+const mongoose = require('mongoose');              // mongoose@8.x
 
 // ============================================================
 // بخش ۲: ایمپورت میدلورها و کنترلرها
@@ -28,55 +30,14 @@ const {
   retrieveHashtagPosts,
 } = require('../controllers/postController');
 const filters = require('../utils/filters');
+const { uploadPostImage } = require('../utils/fileUpload'); // [v2.0.0] جایگزین پیکربندی Multer
 
 // ============================================================
-// بخش ۳: ثابت‌های پیکربندی
-// ============================================================
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // ۱۰ مگابایت
-const ALLOWED_MIME_TYPES = [
-  'image/jpeg',
-  'image/png',
-  'image/webp',
-  'image/gif',
-];
-
-// ============================================================
-// بخش ۴: تنظیمات ذخیره‌سازی Multer (Disk Storage)
-// ============================================================
-const storage = multer.diskStorage({
-  // مقصد ذخیره‌سازی فایل‌ها
-  destination: function (req, file, cb) {
-    cb(null, 'public/uploads/');
-  },
-  // نام‌گذاری یکتا برای هر فایل
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, 'post-' + uniqueSuffix + path.extname(file.originalname));
-  },
-});
-
-// ============================================================
-// بخش ۵: میدلور آپلود (Multer Middleware)
-// ============================================================
-const upload = multer({
-  storage: storage,
-  limits: { fileSize: MAX_FILE_SIZE },
-  fileFilter: function (req, file, cb) {
-    // فقط تصاویر با فرمت‌های مجاز پذیرفته شوند
-    if (ALLOWED_MIME_TYPES.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error('فقط فایل‌های تصویری JPEG، PNG، WebP و GIF مجاز هستند.'), false);
-    }
-  },
-}).single('image'); // فیلد تصویر در درخواست 'image' نام دارد
-
-// ============================================================
-// بخش ۶: محدودسازی نرخ (Rate Limiter) برای ایجاد پست
+// بخش ۳: محدودسازی نرخ (Rate Limiter) برای ایجاد پست
 // ============================================================
 const postCreationLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // ۱۵ دقیقه
-  max: 5, // حداکثر ۵ پست
+  max: 5,                  // حداکثر ۵ پست در بازه
   standardHeaders: true,
   legacyHeaders: false,
   message: {
@@ -86,7 +47,7 @@ const postCreationLimiter = rateLimit({
 });
 
 // ============================================================
-// بخش ۷: میدلور اعتبارسنجی ObjectId
+// بخش ۴: میدلور اعتبارسنجی ObjectId
 // ============================================================
 const validateObjectId = (paramName) => (req, res, next) => {
   const id = req.params[paramName];
@@ -100,36 +61,33 @@ const validateObjectId = (paramName) => (req, res, next) => {
 };
 
 // ============================================================
-// بخش ۸: تعریف مسیرهای پست‌ها
+// بخش ۵: تعریف مسیرهای پست‌ها (توجه به ترتیب برای جلوگیری از تداخل)
 // ============================================================
 
-// ---------- ایجاد پست جدید ----------
-// POST /api/posts
-postRouter.post(
-  '/',
-  postCreationLimiter,
-  requireAuth,
-  (req, res, next) => {
-    // مدیریت خطای Multer به صورت دستی
-    upload(req, res, function (err) {
-      if (err instanceof multer.MulterError) {
-        // خطای مربوط به خود Multer (مثلاً اندازه فایل)
-        return res.status(400).json({
-          success: false,
-          error: err.message,
-        });
-      } else if (err) {
-        // خطای سفارشی (مانند نوع فایل نامعتبر)
-        return res.status(400).json({
-          success: false,
-          error: err.message,
-        });
-      }
-      next();
-    });
-  },
-  asyncHandler(createPost)
-);
+// ---------- دریافت لیست فیلترهای تصویر ----------
+// GET /api/posts/filters
+// [v2.0.0] مسیر ثابت پیش از مسیرهای پارامتری
+postRouter.get('/filters', (req, res) => {
+  res.status(200).json({ success: true, data: filters });
+});
+
+// ---------- دریافت فید پست‌ها (صفحه اصلی) ----------
+// GET /api/posts/feed?offset=0
+// [v2.0.0] جابجایی به بالای مسیر :postId برای جلوگیری از تفسیر "feed" به عنوان شناسه
+postRouter.get('/feed', requireAuth, asyncHandler(retrievePostFeed));
+
+// ---------- دریافت پست‌های پیشنهادی (اکسپلور) ----------
+// GET /api/posts/suggested?offset=0
+// [v2.0.0] مسیر ثابت پیش از مسیر :postId
+postRouter.get('/suggested', requireAuth, asyncHandler(retrieveSuggestedPosts));
+
+// ---------- جستجوی پست‌ها بر اساس هشتگ ----------
+// GET /api/posts/hashtag/:hashtag?offset=0
+postRouter.get('/hashtag/:hashtag', asyncHandler(retrieveHashtagPosts));
+
+// ---------- دریافت یک پست خاص ----------
+// GET /api/posts/:postId
+postRouter.get('/:postId', validateObjectId('postId'), asyncHandler(retrievePost));
 
 // ---------- رأی‌دهی به یک پست (لایک/دیسلایک) ----------
 // POST /api/posts/:postId/vote
@@ -140,41 +98,28 @@ postRouter.post(
   asyncHandler(votePost)
 );
 
-// ---------- دریافت پست‌های پیشنهادی (اکسپلور) ----------
-// GET /api/posts/suggested?offset=0
-postRouter.get(
-  '/suggested',
+// ---------- ایجاد پست جدید ----------
+// POST /api/posts
+// [v2.0.0] استفاده از uploadPostImage (memoryStorage) برای سازگاری با sharp در کنترلر
+postRouter.post(
+  '/',
+  postCreationLimiter,
   requireAuth,
-  asyncHandler(retrieveSuggestedPosts)
-);
-
-// ---------- دریافت لیست فیلترهای تصویر ----------
-// GET /api/posts/filters
-postRouter.get('/filters', (req, res) => {
-  res.status(200).json({ success: true, data: filters });
-});
-
-// ---------- دریافت یک پست خاص ----------
-// GET /api/posts/:postId
-postRouter.get(
-  '/:postId',
-  validateObjectId('postId'),
-  asyncHandler(retrievePost)
-);
-
-// ---------- دریافت فید پست‌ها (صفحه اصلی) ----------
-// GET /api/posts/feed?offset=0
-postRouter.get(
-  '/feed',
-  requireAuth,
-  asyncHandler(retrievePostFeed)
-);
-
-// ---------- جستجوی پست‌ها بر اساس هشتگ ----------
-// GET /api/posts/hashtag/:hashtag?offset=0
-postRouter.get(
-  '/hashtag/:hashtag',
-  asyncHandler(retrieveHashtagPosts)
+  (req, res, next) => {
+    // مدیریت خطای آپلود با uploadPostImage (میدلور یکپارچه Multer)
+    uploadPostImage(req, res, function (err) {
+      if (err) {
+        // خطاهای مربوط به Multer (اندازه، فرمت و...)
+        return res.status(400).json({
+          success: false,
+          error: err.message,
+        });
+      }
+      // در صورت موفقیت، req.file حاوی buffer تصویر خواهد بود
+      next();
+    });
+  },
+  asyncHandler(createPost)
 );
 
 // ---------- حذف یک پست ----------
@@ -187,6 +132,6 @@ postRouter.delete(
 );
 
 // ============================================================
-// بخش ۹: صادرات Router
+// بخش ۶: صادرات Router
 // ============================================================
 module.exports = postRouter;
